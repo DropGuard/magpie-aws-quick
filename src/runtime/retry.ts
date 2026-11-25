@@ -39,8 +39,10 @@ export function nextRetry(state: RetryState, err: TurnFailure | undefined): Retr
   // Surface the labelled block instead.
   if (kind === 'guardrail') return { type: 'stop' }
   // Never re-send on auth trouble or a timeout (the watchdog already ran), and
-  // only when a cached thread exists to re-send FROM.
-  if (kind === 'auth' || kind === 'timeout') return { type: 'stop' }
+  // only when a cached thread exists to re-send FROM. An empty answer already
+  // spent its own bounded retries on the same thread; resending the whole
+  // transcript would just buy the same silence again.
+  if (kind === 'auth' || kind === 'timeout' || kind === 'empty') return { type: 'stop' }
   if (state.produced || !state.reused) return { type: 'stop' }
   return { type: 'fresh-thread-retry' }
 }

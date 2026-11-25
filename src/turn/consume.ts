@@ -31,12 +31,14 @@ export interface StreamState {
 export interface Salvage {
   /** Client-tool calls salvaged from Quick's native channel this turn. */
   salvageCalls: { name: string; arguments: string }[]
-  /** A <tool_call> the model failed to finish — restated on the next turn. */
+  /** An <invoke> the model failed to finish — restated on the next turn. */
   droppedCall: { reason: string; name: string } | null
 }
 
 export interface ConsumeOptions {
   tools: any[]
+  /** Clamp Quick's reported context window (it reports 1M; the client should not plan for it). */
+  contextWindowCap?: number
   canonClientTool: (name: any) => string | null
   showQuickTools: boolean
 }
@@ -63,7 +65,7 @@ const PSEUDO200_PHRASES = [
 // can be retried before the client sees anything — which is what a user would
 // otherwise do by hand with "continue".
 export const GUARDRAIL_LABEL = '[Quick 审核拦截] '
-export const GUARDRAIL_RETRY_NUDGE = 'Continue the previous request. The last attempt was stopped by a server-side content check before any answer; produce the answer now and call client tools with <tool_call> blocks.'
+export const GUARDRAIL_RETRY_NUDGE = 'Continue the previous request. The last attempt was stopped by a server-side content check before any answer; produce the answer now and call client tools with <invoke> blocks.'
 const GUARDRAIL_PHRASES = [
   'that content did not pass our automated check',
   "the model's content filter stopped this reply",
@@ -109,7 +111,7 @@ function isUsageLimitPayload(p: any) {
 const QUOTA_ERR = 'Quick 账号用量已用尽（usage limit），请等待额度重置或更换账号'
 
 /** Usage object from a turn_usage event payload (snake_case wire fields). */
-export function usageFrom(u: any) {
+export function usageFrom(u: any, contextWindowCap?: number) {
   if (!u || typeof u !== 'object') return null
   const input = Number(u.input_tokens ?? u.inputTokens) || 0
   const cached = Number(u.cache_read_tokens ?? u.cached_input_tokens ?? u.cachedInputTokens) || 0
@@ -120,7 +122,8 @@ export function usageFrom(u: any) {
   const prompt = input + cached + written
   const total = Number(u.total_tokens ?? u.totalTokens) || prompt + completion
   const cost = Number(u.cost_usd ?? u.costUsd)
-  const ctx = Number(u.context_window ?? u.contextWindow)
+  const rawCtx = Number(u.context_window ?? u.contextWindow)
+  const ctx = Number.isFinite(rawCtx) && rawCtx > 0 && contextWindowCap ? Math.min(rawCtx, contextWindowCap) : rawCtx
   const resolved = u.resolved_model_id ?? u.served_model_id ?? u.resolvedModelId
   return {
     prompt_tokens: prompt,
@@ -175,6 +178,30 @@ function progressEvent(evt: any): boolean {
  * QuickWsError kind 'quota' | 'guardrail' | 'stream' on failure — the caller
  * owns retry policy.
  */
+/**
+ * What the client sees when a dropped tool call is not retried: a note saying
+ * what happened, and — when no other call exists — a placeholder call to a
+ * tool no client has. The client answers the placeholder with an error result,
+ * which keeps its agent loop going and gives the next turn a place to tell the
+ * model what to resend.
+ */
+export function droppedItems(salvage: Salvage, state: StreamState): TurnItem[] {
+  const dc = salvage.droppedCall
+  if (!dc) return []
+  const items: TurnItem[] = [{
+    type: 'note',
+    text: dc.reason === 'unterminated'
+      ? '[quick] 模型的工具调用没写完（回复在 </invoke> 之前就结束了），这次调用没有执行，已让模型重发'
+      : '[quick] 模型的工具调用格式有误（invoke/parameter 不完整），这次调用没有执行，已让模型重发',
+  }]
+  if (!state.calls.length) {
+    const id = newCallId()
+    state.calls.push({ id, name: INVALID_CALL_TOOL })
+    items.push({ type: 'tool_call', id, name: INVALID_CALL_TOOL, arguments: JSON.stringify({ tool: dc.name, reason: dc.reason }) })
+  }
+  return items
+}
+
 export async function* consumeTurn(
   events: AsyncIterable<any>,
   tid: string,
@@ -184,7 +211,7 @@ export async function* consumeTurn(
   hooks: ConsumeHooks = {},
 ): AsyncGenerator<TurnItem> {
   const { tools, canonClientTool, showQuickTools } = opts
-  let parser = tools.length ? createToolCallParser() : null
+  let parser = tools.length ? createToolCallParser({ tools }) : null
   // Quick's memory citations (<sources>[…](mem://…)</sources>) still leak past
   // the prompt note now and then; strip them from the visible text.
   let sources = createSourcesStripper()
@@ -213,8 +240,9 @@ export async function* consumeTurn(
     if (text) { state.text += text; yield { type: 'text', text } }
     for (const c of r.calls ?? []) {
       const id = newCallId()
-      state.calls.push({ id, name: c.name })
-      yield { type: 'tool_call', id, name: c.name, arguments: JSON.stringify(c.arguments ?? {}) }
+      const name = canonClientTool(c.name) ?? c.name
+      state.calls.push({ id, name })
+      yield { type: 'tool_call', id, name, arguments: JSON.stringify(c.arguments ?? {}) }
     }
   }
 
@@ -248,7 +276,7 @@ export async function* consumeTurn(
     } else if (t === 'tool_arguments') {
       if (p.tool_id) pendingNative.delete(p.tool_id)
       // Native client call: the full args object just arrived. Emit it like a
-      // parsed <tool_call>; the step-end stop happens on the next turn_usage
+      // parsed <invoke>; the step-end stop happens on the next turn_usage
       // (yielded first) or a tool_result for a salvaged id.
       const canon = canonClientTool(p.tool_name)
       const dup = p.tool_id && salvagedIds.has(p.tool_id)
@@ -268,7 +296,7 @@ export async function* consumeTurn(
       endSalvage()
       return
     } else if (t === 'turn_usage') {
-      const u = usageFrom(p)
+      const u = usageFrom(p, opts.contextWindowCap)
       if (u) { state.usage = addUsage(state.usage, u); yield { type: 'usage', usage: u } }
       if (salvage.salvageCalls.length) { endSalvage(); return }
     } else if (t === 'message_complete') {
@@ -315,28 +343,15 @@ export async function* consumeTurn(
     if (tail.text) yield* emitParsed({ text: tail.text, calls: [] })
     for (const c of tail.calls ?? []) {
       const id = newCallId()
-      state.calls.push({ id, name: c.name })
-      yield { type: 'tool_call', id, name: c.name, arguments: JSON.stringify(c.arguments ?? {}) }
+      const name = canonClientTool(c.name) ?? c.name
+      state.calls.push({ id, name })
+      yield { type: 'tool_call', id, name, arguments: JSON.stringify(c.arguments ?? {}) }
     }
     if (tail.dropped) {
+      // The caller decides whether to retry the turn first. Emitting the note
+      // and the placeholder here would send an error to the client before the
+      // retry has a chance; droppedItems() is called only when giving up.
       salvage.droppedCall = { reason: tail.dropped, name: tail.droppedName || '' }
-      yield {
-        type: 'note',
-        text: tail.dropped === 'unterminated'
-          ? '[quick] 模型的工具调用没写完（回复在 </tool_call> 之前就结束了），这次调用没有执行，已让模型重发'
-          : '[quick] 模型的工具调用格式有误（JSON 无法解析），这次调用没有执行，已让模型重发',
-      }
-      // A turn that ends with no tool call makes agent clients stop and wait
-      // for the user. Hand them a placeholder call to a tool that doesn't
-      // exist instead: nothing runs, the client answers with an error result
-      // and keeps its loop going (verified with Claude Code), and the next
-      // turn tells the model what to resend.
-      if (!state.calls.length) {
-        const id = newCallId()
-        const args = JSON.stringify({ tool: salvage.droppedCall.name, reason: tail.dropped })
-        state.calls.push({ id, name: INVALID_CALL_TOOL })
-        yield { type: 'tool_call', id, name: INVALID_CALL_TOOL, arguments: args }
-      }
     }
   }
   const rest = sources.end()

@@ -60,40 +60,29 @@ Python 后端（`quickwork-agent`，打包在 `resources/agent.zip` 里），以
 ### 会话复用（thread reuse）
 
 Quick 在服务端按 `thread_id` 保存会话历史，而 OpenAI 客户端每次请求都重发
-完整 transcript。本插件用三级续接判定，越精确的优先级越高：
+完整 transcript。本插件只做一种判定：
 
-- **增量哈希链** —— 每个请求对规范化后的消息列表计算 `h[k] = H(scope,
-  m1…mk)`。命中即表示客户端是在"我们已经回答过的会话"上追加了新消息，
-  于是只把新增的尾部（user turn / tool result）发给上游；更早的历史由
-  Quick 服务端保存，prompt cache 也保持命中。
-- **模糊锚点** —— 客户端扩展压缩/改写旧消息时（compaction、历史手术），
-  严格哈希链会断。此时按位置无关的锚点匹配：我们上一条回复的回显，加上
-  它之前的三条消息的内容哈希。修剪造成的位置漂移不影响判定；尾部被
-  改写过则仍正确地新建 thread。
-- **网关会话键** —— 最后兜底：网关会在同一对话的每个请求上打上稳定的
-  会话 id（magpie 的 `x-magpie-session` 头；pi 等 OpenAI 客户端也会发
-  自己的 session-affinity 头）。即使历史被改写到内容锚点都认不出，
-  也能凭这个键续上原 thread；该条目每轮自我刷新，激进压缩也不会让它
-  失联。
-
-层级顺序很重要：内容匹配命中永远优先，会话键只在前两级都失败时启用。
-
-- **scope 隔离** —— 哈希链按 `H(账号, agent_mode, system prompt)` 命名空间
-  隔离：换账号、换模型或改 system prompt，都会透明地新建 thread，而不是续接到
-  一个不匹配的旧会话。思考强度是逐轮字段，不会拆分 thread；工具按 thread 记录，
-  会话中途新增工具（Claude Code 的 ToolSearch、skill）时继续用原 thread，只补发
-  新工具的说明。
+- **增量哈希链** —— 每个请求对消息列表计算 `h[k] = H(scope, m1…mk)`，其中
+  assistant 消息只按一个占位符计入，**不把正文或 tool_call id 写进哈希**。
+  客户端重写自己的回复（裁剪、note、重新生成 id、丢 thinking）不影响续接；
+  命中即只把新增的 user/tool 尾部发给上游，更早的历史由 Quick 服务端保存。
+- **只在真正的历史编辑处换 thread** —— user/tool 消息的内容变了（编辑、
+  客户端 compaction、历史手术），哈希链就断，插件新建 thread 并重发当前
+  transcript。旧 thread 的服务端上下文已经和客户端手里的对话不一致；继续
+  续它就是“模型记得的东西”和“客户端以为它记得的东西”分叉。
+- **thread 身份只看账号、会话键和消息前缀** —— system prompt、agent_mode、
+  工具列表、思考强度都不参与。Claude Code 会在会话中途改 system prompt
+  （memory、billing、ToolSearch）或换模型档位，这些变化不该丢掉 thread。
 - **失败不丢 thread** —— 复用的这一轮出错或被取消（499、内容过滤、空闲超时）时，
-  原 thread 会放回缓存，下一次请求照样续接。会话键兜底只在新的工具结果对应的是
-  这个 thread 发出的调用时才续接，共用同一个会话 ID 的并行子代理不会串到彼此的
-  thread 上。
-- **编辑/分叉检测** —— 更早消息的任何改动都会改变哈希，所以被编辑或
-  分叉的历史永远不会误续接；只有纯追加的尾部才合格。缓存条目使用即
-  销毁（single-use），客户端重试也不会重放一个 turn。
-- **有界内存** —— 条目空闲 24 小时过期（agent 会话的轮次间隔远超半小时），
-  LRU 上限 200 个 thread。缓存持久化到 `thread-sessions.json`（只存哈希 +
-  thread id，无内容），插件重载后仍可续接；命中过期 thread 是安全的：
-  handler 会用完整 transcript 自动重试一次新 thread。
+  原 thread 放回缓存，下一次请求照样续接。
+- **有界内存** —— 条目空闲 24 小时过期，LRU 上限 200 个 thread。缓存持久化到
+  `thread-sessions.json`（只存消息 key 哈希、thread id 和工具名，无内容），插件重载后
+  仍可续接。
+
+这比旧版的三级判定（哈希链 + 模糊锚点 + 会话键兜底）简单得多，也去掉了
+“跨会话 session key 碰撞”和“compaction 后继续续旧 thread”两类问题。代价是：
+客户端 compaction 后不再有服务端旧上下文，模型要靠压缩后的历史重新建立状态——
+这正是 `magpie-aws-quick-bridge` 的做法，也是它上下文不会膨胀到 500k 的原因。
 
 ### 模型：agent_mode，不是模型 id
 
@@ -147,7 +136,7 @@ magpie login aws-quick              # 按提示选择登录方式
 
 - **账号登录（浏览器 OAuth）**：打开 `quick.aws.com/sn` 登录页，插件在本地
   回调端口接住授权码，自行完成动态客户端注册 + code 换 token + user-info，
-  然后把 `{jwt, ws_host, refresh_token, …}` 存到
+  然后把统一凭据记录 `{ tokens: { access_token, refresh_token, id_token, expires_at }, client: { client_id, client_secret, … }, tenant_url, ws_host, actor_arn, … }` 存到
   `%APPDATA%\magpie-aws-quick\oauth-sessions.json`（Windows）/
   `~/.config/magpie-aws-quick/`（Linux）/
   `~/Library/Application Support/magpie-aws-quick/`（macOS），权限 `0600`。
@@ -188,6 +177,14 @@ magpie login aws-quick              # 按提示选择登录方式
 - `stableDeviceId`（默认 `true`）：直连会话把按账号固定的设备 ID 作为
   `outpostId` 发送（见上文"设备 ID"）；`false` 改发空值。
 - `guardrailRetries`（默认 `1`）：一轮被 Quick 服务端审核拦下（回复里只有一句固定文案、usage 为 0）时，插件在客户端看到之前自动在同一 thread 上重试几次；`0` 关闭，直接把拦截交给客户端。
+- `callRetries`（默认 `1`）：模型输出的 `<invoke>` 块没写完或 `<parameter>` 不合法时，先在同一 thread 上要求它重发（必要时拆小）；只有在它仍然失败时才把占位调用 `aws_quick_invalid_tool_call` 交给客户端。客户端已经在上一轮看到了正文或有效工具调用时不再重试，避免重复。
+- `answerRetries`（默认 `0`）：一轮正常结束、但只输出了推理、正文和工具调用都为空（Claude Code 里表现为 “Thought for Ns” 后什么都不写）时，默认直接以 502 报错，而不是再花几分钟重试——重试解决不了模型不收敛的问题。设为 `1` 才会在同一 thread 上再要求模型直接回答，并把思考强度降一档。
+- `thinkingEffortCap`（默认 `high`，对齐旧桥）：给客户端的思考强度设上限。你设 `medium` 就发 `medium`，设 `high` 就发 `high`，只有 `max` 会被压成 `high`；`'max'` 可关闭封顶，`'medium'` 更快。
+- `contextWindow`（默认 `1000000`，即 Quick 自己报的值）：可选的客户端上下文上限。调低会让 Claude Code 更早 compaction；对读文件的 agent 通常不划算。
+
+**为什么默认压掉 max？** 实测（Claude Code + `smart`，`max` 强度，368 轮）：输出 token 中位数 2442、P90 约 2.6 万、最大 63322（正好贴着 64k 输出上限）；单轮耗时中位数 34 秒、P90 4 分 47 秒、最长 21 分 49 秒。旧桥从来不把 `max` 发给 Quick：它在网关层就把 `max/xhigh` 映射成 `high`。这是它“慢但能用”的主要原因之一。
+
+**64KB 单帧与工具结果。** 一个 17k token 的 Read 结果约 68KB，本身就超过一帧；插件要么截断（模型会重跑同一个调用），要么上传成附件（模型要多花一个服务端步骤去读）。所以能分块读的地方就分块读、命令输出用 head/tail；这是从源头减少重读循环的位置。
 
 ## 常见问题
 
@@ -207,11 +204,11 @@ magpie login aws-quick              # 按提示选择登录方式
   其他账号。
 - **工具调用是文本约定模拟**：Quick 的 agent 在服务端自带工具链（浏览器、本地文件、MCP 等），
   `tool_start`/`tool_result` 等事件由它自己执行、客户端只观测，`message_complete.tool_calls`
-  恒为空。客户端传入的 OpenAI `tools` 通过提示词注入为 `<tool_call>{json}</tool_call>`
-  文本约定，由插件解析成标准 `tool_calls` 返回；`tool` 角色的结果渲染为
-  `[tool_result …]` 续接同一 thread。完整的工具说明每个 thread 只发一次，
-  复用 thread 的后续轮次只带一段简短提醒：消息里的内容都会留在 Quick 的
-  thread 历史里、计入上下文。可靠性取决于模型遵守约定——已实测
+  恒为空。客户端传入的 OpenAI `tools` 通过提示词注入为 Anthropic 风格的
+  `<function_calls><invoke><parameter>` XML 约定，由插件解析成标准 `tool_calls`
+  返回；`tool` 角色的结果渲染为 `<tool_result …>` 块续接同一 thread。完整的工具说明走 `custom_prompt`
+  （和旧桥一样，不进 Quick 的对话历史），只在 fresh thread 或新增工具时发；
+  每条 user message 末尾附一段简短提醒。可靠性取决于模型遵守约定——已实测
   `tool_choice:'required'` 下 smart/advanced 均能稳定产出；模型偶尔会先用
   自带工具（如联网搜索）直接作答，此时表现为普通文本回复。若模型改用
   Quick 自己的原生工具通道调用了客户端声明的工具，插件会识别该调用并按
@@ -232,8 +229,9 @@ magpie login aws-quick              # 按提示选择登录方式
 - **消息体积**：整个 `user_message` 帧服务端上限 64KB（`text` 与
   指令及附件共享）。超大 system prompt / 工具 schema / 会话历史会自动
   压缩（schema 去注解、工具规格 lite→仅名字降级、tool_result 封顶）。整段对话装不进
-  一帧时，插件把它上传成 `context_*.txt` 附件（走 Quick 自己的附件流程），帧里只留
-  "读附件再继续" 的说明和最新一条消息——模型用文件工具读全文，不会丢历史。
+  一帧时，插件按旧桥的方式处理：把"最后一条消息之前"的对话上传成
+  `context_*.txt` 附件，帧里保留一段"先读完整文件再继续"的说明；最后一条
+  消息如果不超过 6KB，也留在帧里，当前这轮不用读文件就能看到。
   附件也传不上去时，请求以 400 `context_length_exceeded` 失败，让客户端压缩自己的
   历史，而不是静默截断（静默截断会让模型反复重读、忘记任务）。设
   `contextAttachments:false` 可关闭这一行为（同样保留响亮的 400）。
@@ -253,7 +251,7 @@ magpie login aws-quick              # 按提示选择登录方式
 - 本地凭据路径下 `id_token`/`ws_host`/`actor_arn` 等只在内存中流转；会话缓存
   只存哈希 + thread id（无消息内容），持久化到 `thread-sessions.json`，
   插件重载后仍可续接 thread。
-- OAuth 路径会把 `{jwt, refresh_token, client_secret, …}` 存入
+- OAuth 路径会把 `{type:'oauth', tokens:{access_token, refresh_token, id_token, expires_at}, client:{client_id, client_secret, …}, tenant_url, ws_host, …}` 存入
   `oauth-sessions.json`（0600）——这是 refresh token 轮换的必然要求，
   与 Quick 桌面端自身在系统凭据存储里保存登录态等价；请保护好自己的用户目录。
 - 本地凭据（Credential Manager）路径只**读取**应用已存的会话；续期时把

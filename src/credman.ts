@@ -13,7 +13,7 @@ import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { readQuickCredentials, writeQuickCredential } from './wincred.ts'
-import { createDirectBackend, defaultStoreDir, isDeviceId } from './oauth.ts'
+import { createDirectBackend, defaultStoreDir, expiresAt, isDeviceId, normalizeSession } from './oauth.ts'
 
 const REGION_RE = /(us|eu|ap|sa|ca|me|af|il)-(east|west|north|south|central|northeast|southeast|southwest|northwest)-\d/
 
@@ -30,25 +30,24 @@ function profilesJsonPath() {
 export function sessionFromBlob(blob, target) {
   const tenant = String(blob.tenant_url || '').replace(/\/+$/, '')
   const now = Math.floor(Date.now() / 1000)
-  return {
+  return normalizeSession({
+    type: 'oauth',
     provider: 'social',
     stage: 'prod',
     tenant_url: tenant,
     ws_host: tenant ? new URL(tenant).host : '',
-    jwt: blob.access_token || '',
     actor_arn: '',
     aws_account_id: blob.aws_account_id || '',
     account_name: blob.account_name || '',
     email: blob.email || '',
     display_name: blob.display_name || '',
     region: regionFromTenant(tenant),
-    usable_until: Math.floor(Number(blob.access_token_expiry) || 0),
     obtained_at: now,
     tokens: {
       access_token: blob.access_token || '',
       refresh_token: blob.refresh_token || '',
       id_token: '',
-      expires_in: 0,
+      expires_at: Math.floor(Number(blob.access_token_expiry) || 0),
     },
     client: {
       client_id: blob.client_id || '',
@@ -58,7 +57,7 @@ export function sessionFromBlob(blob, target) {
     },
     _credTarget: target,
     _raw: { ...blob },
-  }
+  })
 }
 
 /** Merge refreshed tokens back into the app's blob shape for CredWrite. */
@@ -68,7 +67,7 @@ export function mergeForCredWrite(sess) {
     ...raw,
     refresh_token: sess?.tokens?.refresh_token || raw.refresh_token,
     access_token: sess?.tokens?.access_token || raw.access_token,
-    access_token_expiry: sess?.usable_until || raw.access_token_expiry,
+    access_token_expiry: expiresAt(sess) || raw.access_token_expiry,
   }
 }
 

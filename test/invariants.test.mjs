@@ -111,7 +111,7 @@ test('invariant: injected instructions are never squeezed, only the spec degrade
   assert.ok(payload.text.includes('RULES-HEAD') && payload.text.includes('RULES-TAIL'))
   assert.ok(!/middle omitted[\s\S]{0,40}RULES/.test(payload.text), 'no squeeze marker inside the rules block')
   // Graduated compression: descriptions give way first, parameter schemas stay.
-  assert.ok(payload.text.includes('"required"') || payload.text.includes('"path"'), 'schemas survive the description trim')
+  assert.ok(payload.custom_prompt.includes('"required"') || payload.custom_prompt.includes('"path"'), 'schemas survive the description trim')
   // Description-only caps are silent by policy (schema intact, hits every
   // fresh session's first frame); dropping schemas is what must be stated.
   assert.ok(!said.includes('工具说明过长') && !said.includes('单帧上限'), `a description-only cap is silent: ${said}`)
@@ -136,7 +136,7 @@ test('invariant: dropping parameter schemas is named', async () => {
   const { payload, said } = await run({ model: 'fast', messages, tools: huge })
   assert.ok(payload.text.includes('RULES-HEAD') && payload.text.includes('RULES-TAIL'))
   assert.match(said, /已省略参数结构/, 'the schema drop is stated')
-  assert.ok(!payload.text.includes('"required"'), 'schemas are gone in this frame')
+  assert.ok(!payload.custom_prompt.includes('"required"'), 'schemas are gone in this frame')
 })
 
 test('invariant: history that cannot fit arrives as an attachment, not as drops', async () => {

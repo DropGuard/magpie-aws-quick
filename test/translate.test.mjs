@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { textOf, modeFor, effortFor, renderTranscript, renderDelta, byteLen, capText, UPSTREAM_TEXT_LIMIT, imagesOf, pickImages, MAX_UPLOAD_IMAGE_BYTES, MAX_UPLOADS, MAX_UPLOAD_TOTAL_BYTES } from '../src/translate.ts'
+import { textOf, modeFor, effortFor, capEffort, lowerEffort, renderTranscript, renderDelta, byteLen, capText, UPSTREAM_TEXT_LIMIT, imagesOf, pickImages, MAX_UPLOAD_IMAGE_BYTES, MAX_UPLOADS, MAX_UPLOAD_TOTAL_BYTES } from '../src/translate.ts'
 
 test('textOf handles strings, parts arrays, and junk', () => {
   assert.equal(textOf('hi'), 'hi')
@@ -22,7 +22,7 @@ test('textOf understands Anthropic/Responses-style content parts', () => {
   )
   assert.equal(
     textOf([{ type: 'tool_use', name: 'Read', input: { path: '/a' } }]),
-    '[called tool Read({"path":"/a"})]',
+    '<invoke name="Read"><parameter name="path">/a</parameter></invoke>',
   )
   // reasoning blocks contribute nothing
   assert.equal(
@@ -53,6 +53,26 @@ test('effortFor maps header/body spellings to quick levels', () => {
   assert.equal(effortFor(undefined, {}), undefined)
 })
 
+test('capEffort clamps only downward and leaves unset alone', () => {
+  assert.equal(capEffort('max', 'high'), 'high')
+  assert.equal(capEffort('max', 'medium'), 'medium')
+  assert.equal(capEffort('high', 'high'), 'high')
+  assert.equal(capEffort('low', 'high'), 'low')
+  assert.equal(capEffort('off', 'medium'), 'off')
+  assert.equal(capEffort('max', 'max'), 'max')
+  assert.equal(capEffort(undefined, 'high'), undefined)
+  assert.equal(capEffort('max', 'bogus'), 'max') // an unknown cap is not a cap
+})
+
+test('lowerEffort drops one level and stops at off', () => {
+  assert.equal(lowerEffort('max'), 'high')
+  assert.equal(lowerEffort('high'), 'medium')
+  assert.equal(lowerEffort('medium'), 'low')
+  assert.equal(lowerEffort('low'), 'off')
+  assert.equal(lowerEffort('off'), undefined)
+  assert.equal(lowerEffort(undefined), undefined)
+})
+
 test('renderTranscript: system + history + raw final user turn', () => {
   const messages = [
     { role: 'user', content: 'first' },
@@ -80,7 +100,7 @@ test('renderDelta renders only new user/tool content', () => {
   ]
   const out = renderDelta(delta)
   assert.ok(out.includes('next question'))
-  assert.ok(out.includes('[tool_result read c1]'))
+  assert.ok(out.includes('<tool_result tool_use_id="c1" name="read">'))
   assert.ok(out.includes('file body'))
 })
 
@@ -135,7 +155,7 @@ test('renderDelta caps oversized tool results per block', () => {
   const stats = {}
   const out = renderDelta(delta, { stats })
   assert.ok(stats.truncated)
-  assert.ok(out.includes('[tool_result read c1]'))
+  assert.ok(out.includes('<tool_result tool_use_id="c1" name="read">'))
   assert.ok(out.includes('next'))
   assert.ok(byteLen(out) < 20 * 1024) // 16KB cap + small user msg
 })
@@ -152,7 +172,7 @@ test('renderDelta shares the budget across parallel tool results instead of drop
   assert.ok(stats.truncated)
   assert.ok(byteLen(out) <= 20 * 1024)
   assert.ok(out.endsWith('final question'))
-  for (const h of ['[tool_result a c1]', '[tool_result b c2]', '[tool_result c c3]']) assert.ok(out.includes(h), h)
+  for (const h of ['<tool_result tool_use_id="c1" name="a">', '<tool_result tool_use_id="c2" name="b">', '<tool_result tool_use_id="c3" name="c">']) assert.ok(out.includes(h), h)
   assert.ok(!out.includes('earlier message(s) omitted'))
   assert.equal((out.match(/middle omitted/g) || []).length, 3)
 })

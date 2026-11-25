@@ -4,6 +4,9 @@
 // actually passes to the model.
 
 /** Text content of one content-part object (OpenAI/Anthropic/Responses shapes). */
+const xmlText = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+const xmlAttr = (s) => xmlText(s).replace(/"/g, '&quot;')
+
 function partText(p) {
   if (typeof p === 'string') return p
   const t = p?.type
@@ -12,8 +15,13 @@ function partText(p) {
   if (t === 'file' || t === 'input_file') return '[file omitted]'
   if (t === 'tool_result') return textOf(p.content) // string or nested parts
   if (t === 'tool_use') {
-    const args = typeof p.input === 'string' ? p.input : JSON.stringify(p.input ?? {})
-    return `[called tool ${p.name ?? 'tool'}(${args})]`
+    let args = p.input
+    if (typeof args === 'string') { try { args = JSON.parse(args) } catch { args = {} } }
+    if (!args || typeof args !== 'object') args = {}
+    const params = Object.entries(args)
+      .map(([k, v]) => `<parameter name="${xmlAttr(k)}">${xmlText(typeof v === 'string' ? v : JSON.stringify(v))}</parameter>`)
+      .join('')
+    return `<invoke name="${xmlAttr(p.name ?? 'tool')}">${params}</invoke>`
   }
   return '' // thinking/redacted_thinking/audio/etc carry no user-visible text
 }
@@ -147,15 +155,42 @@ export function effortFor(effortHeader, body) {
   return map[v] ?? (v === 'enabled' || v === 'true' ? 'high' : v === 'disabled' || v === 'false' ? 'off' : undefined)
 }
 
+/**
+ * Clamp a requested effort to a ceiling. Quick's `max` is not "a bit more"
+ * thinking: measured turns spent 50–63k output tokens and 8–22 minutes before
+ * calling a tool, while the model's whole output budget is 64k — so it often
+ * had nothing left for the answer the client was waiting for. `high` keeps a
+ * strong reasoning level without that cliff. The default is pass-through
+ * (`'max'`); set `thinkingEffortCap` to bound it explicitly.
+ */
+export function capEffort(level, cap) {
+  const li = EFFORT_LEVELS.indexOf(level)
+  const ci = EFFORT_LEVELS.indexOf(cap)
+  if (li < 0 || ci < 0) return level
+  return EFFORT_LEVELS[Math.min(li, ci)]
+}
+
+/** One level less thinking, for the retry of a turn that only thought. */
+export function lowerEffort(level) {
+  const i = EFFORT_LEVELS.indexOf(level)
+  if (i <= 0) return undefined
+  return EFFORT_LEVELS[i - 1]
+}
+
+/** An assistant tool call in the same XML dialect the model writes. */
 export function renderToolCalls(calls) {
   if (!Array.isArray(calls) || !calls.length) return ''
-  return calls
-    .map((c) => {
-      const name = c?.function?.name ?? c?.name ?? 'tool'
-      const args = c?.function?.arguments ?? c?.arguments ?? ''
-      return `[called tool ${name}(${typeof args === 'string' ? args : JSON.stringify(args)})]`
-    })
-    .join('\n')
+  const blocks = calls.map((c) => {
+    const name = c?.function?.name ?? c?.name ?? 'tool'
+    let args = c?.function?.arguments ?? c?.arguments ?? {}
+    if (typeof args === 'string') { try { args = JSON.parse(args) } catch { args = {} } }
+    if (!args || typeof args !== 'object') args = {}
+    const params = Object.entries(args)
+      .map(([k, v]) => `<parameter name="${xmlAttr(k)}">${xmlText(v === undefined ? '' : typeof v === 'string' ? v : JSON.stringify(v))}</parameter>`)
+      .join('\n')
+    return `<invoke name="${xmlAttr(name)}">${params ? `\n${params}\n` : ''}</invoke>`
+  })
+  return `<function_calls>\n${blocks.join('\n')}\n</function_calls>`
 }
 
 const te = new TextEncoder()
@@ -260,9 +295,10 @@ function shrinkTool(body, max) {
   return head + mark + tailBytes(body, room - byteLen(head))
 }
 
-const toolHead = (m) => `[tool_result ${[m.name, m.tool_call_id].filter(Boolean).join(' ')}]`
+const TOOL_CLOSE = '\n</tool_result>'
+const toolHead = (m) => `<tool_result${m.tool_call_id ? ` tool_use_id="${xmlAttr(m.tool_call_id)}"` : ''}${m.name ? ` name="${xmlAttr(m.name)}"` : ''}>`
 const isTool = (m) => canonRole(m.role) === 'tool' || m.role === 'function'
-const renderBlock = (b) => (b.tool ? `${b.head}\n${b.body}` : b.body)
+const renderBlock = (b) => (b.tool ? `${b.head}\n${b.body}${TOOL_CLOSE}` : b.body)
 
 /**
  * Fit blocks into `maxBytes`. Conversation text is fixed; tool-result bodies
@@ -274,7 +310,7 @@ const renderBlock = (b) => (b.tool ? `${b.head}\n${b.body}` : b.body)
 function fitBlocks(blocks, maxBytes, cut, { pinFirst = false } = {}) {
   // `cut(why)` records the reason; 'history' means whole messages went,
   // 'tool' means a tool result was shrunk to head+tail, 'turn' a message.
-  let avail = maxBytes - blocks.reduce((n, b) => n + 2 + (b.tool ? byteLen(b.head) + 1 : byteLen(b.body)), 0)
+  let avail = maxBytes - blocks.reduce((n, b) => n + 2 + (b.tool ? byteLen(b.head) + byteLen(TOOL_CLOSE) + 1 : byteLen(b.body)), 0)
   const tools = blocks.filter((b) => b.tool).sort((a, b) => byteLen(a.body) - byteLen(b.body))
   let left = tools.length
   for (const b of tools) {
@@ -440,30 +476,6 @@ export function renderTranscript(messages: any[], systemText: string, { maxBytes
   }
   parts.push(last)
   return parts.join('\n\n')
-}
-
-/**
- * The newest messages rendered exactly as the transcript renders them, capped
- * to maxBytes. Used when the whole transcript went to an attachment: the frame
- * repeats this tail so the model can continue without a file read.
- */
-export function renderTail(messages: any[], maxBytes: number): string {
-  const out: string[] = []
-  let used = 0
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i]
-    const tool = isTool(m)
-    const head = tool ? toolHead(m) : ''
-    let body = tool ? textOf(m.content) : transcriptLine(m, () => {}, Infinity)
-    const room = maxBytes - used - (head ? byteLen(head) + 1 : 0)
-    if (room <= 0) break
-    if (byteLen(body) > room) body = tool ? shrinkTool(body, room) : capMiddle(body, room)
-    const piece = head ? `${head}\n${body}` : body
-    out.unshift(piece)
-    used += byteLen(piece) + 2
-    if (used >= maxBytes) break
-  }
-  return out.join('\n\n')
 }
 
 /**

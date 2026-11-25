@@ -214,11 +214,11 @@ The workable bridge (adopted by the plugin, verified end-to-end):
    `web_search_enabled:false` to reduce the model "answering first" with its
    own web-search tool.
 2. The model emits calls as plain text
-   `<tool_call>{"name":…,"arguments":{…}}</tool_call>` (tags may split across
+   `<function_calls><invoke name="…"><parameter name="…">value</parameter></invoke></function_calls>` (tags may split across
    `text_delta`s; the plugin does holdback parsing — see `lib/tools.mjs`).
 3. Parsed results map to OpenAI `tool_calls` with `finish_reason:"tool_calls"`.
 4. Client returns `role:"tool"` results → rendered as
-   `[tool_result <name> <id>] <content>` continuing the same thread (the delta
+   `<tool_result tool_use_id="<id>">content</tool_result>` continuing the same thread (the delta
    only carries new tool/user content).
 
 Limits: relies on the model honoring the convention (`tool_choice:'required'`

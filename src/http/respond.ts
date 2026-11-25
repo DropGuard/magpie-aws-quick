@@ -53,6 +53,8 @@ export interface RespondOptions {
   onError: (e: any) => void
   /** The client went away while streaming: abandon both generators. */
   onCancel: () => void
+  /** The turn is over (success, error or cancel): release the conversation lane. */
+  onSettled?: () => void
 }
 
 /** Render the turn's items as chat.completion (or an SSE stream). */
@@ -78,6 +80,8 @@ export async function respondWithItems(items: AsyncIterable<TurnItem>, opts: Res
     } catch (e) {
       opts.onError(e)
       return errorResponse(httpStatus(e), e?.message ?? String(e), errorType(e))
+    } finally {
+      opts.onSettled?.()
     }
     const message: any = { role: 'assistant', content: text }
     if (reasoning) message.reasoning_content = reasoning
@@ -135,9 +139,10 @@ export async function respondWithItems(items: AsyncIterable<TurnItem>, opts: Res
         controller.enqueue(enc.encode('data: [DONE]\n\n'))
       } finally {
         controller.close()
+        opts.onSettled?.()
       }
     },
-    cancel() { opts.onCancel() },
+    cancel() { opts.onCancel(); opts.onSettled?.() },
   })
   return new Response(stream, {
     status: 200,

@@ -4,13 +4,14 @@
 // tool loop and executes ITS tools server-side (verified live — tool_start/
 // tool_arguments/tool_result events, message_complete.tool_calls stays empty).
 // But the underlying model will happily emit a caller-defined convention as
-// plain text when the instruction is strong and inline (verified: a MANDATORY
-// block in the user text produced exactly `<tool_call>{json}</tool_call>`).
+// plain text when the instruction is strong and inline. The dialect is
+// Anthropic-style XML — <function_calls><invoke name="…"><parameter
+// name="…">value</parameter></invoke></function_calls> — because Claude models
+// know it and it needs no JSON escaping for shell commands or file contents.
 //
-// So we inject tool specs + rules into the message text, parse
-// <tool_call>{"name":…,"arguments":{…}}</tool_call> blocks out of the streamed
-// text, and surface them as OpenAI tool_calls. Results come back as role:'tool'
-// messages, rendered into the next turn's text by renderDelta.
+// So we inject tool specs + rules into the message text, parse <invoke> blocks
+// out of the streamed text, and surface them as OpenAI tool_calls. Results come
+// back as role:'tool' messages, rendered as <tool_result> blocks.
 
 import { byteLen } from './translate.ts'
 
@@ -101,8 +102,8 @@ export function buildToolPreamble(tools, toolChoice, { lite = false, namesOnly =
   const shown = only.length ? only : tools
   const must = forced
     ? only.length === 1 && typeof forced === 'string'
-      ? `This request requires the client tool "${forced}" — reply with only its <tool_call> block.`
-      : 'This request requires a client tool — reply with <tool_call> block(s) only.'
+      ? `This request requires the client tool "${forced}" — reply with only its <invoke name="${forced}"> block.`
+      : 'This request requires a client tool — reply with <invoke> block(s) only.'
     : ''
   // Reused threads already carry the full spec in Quick's server-side
   // history, and everything sent in `text` stays there: re-sending a 30 KB
@@ -113,21 +114,22 @@ export function buildToolPreamble(tools, toolChoice, { lite = false, namesOnly =
     return [
       '[Client tool calling — reminder]',
       `The client tools described earlier in this conversation are still available: ${shown.slice(0, 80).map((t) => t.name).join(', ')}.`,
-      'To call one, reply with ONLY <tool_call>{"name":"<tool_name>","arguments":{<json arguments>}}</tool_call> block(s), no other text; after a [tool_result …] message arrives, continue in plain text.',
+      'To call one, reply with ONLY <function_calls><invoke name="<tool_name>"><parameter name="<arg_name>">value</parameter></invoke></function_calls>, no other text; after a <tool_result …> block arrives, continue in plain text.',
+      'Parameter values are plain text (no JSON escaping); for an object or array argument, put its JSON inside the parameter.',
       must,
     ].filter(Boolean).join('\n')
   }
   const assemble = (specs, header) => [
     '[Client tool calling]',
-    'The application you are assisting exposes the tools below; it executes them on the user\'s machine and returns each result as a [tool_result …] message.',
-    'This channel has no native function-calling API — the <tool_call> marker below is the only way to invoke these tools.',
-    'When the task needs one of them, reply with ONLY a block in this format (no other text):',
-    '<tool_call>{"name":"<tool_name>","arguments":{<json arguments>}}</tool_call>',
+    'The application you are assisting exposes the tools below; it executes them on the user\'s machine and returns each result as a <tool_result …> block.',
+    'This channel has no native function-calling API — the <invoke> block below is the only way to invoke these tools.',
+    'When the task needs one of them, reply with ONLY a <function_calls> block in this format (no other text):',
+    '<function_calls>\n<invoke name="<tool_name>">\n<parameter name="<arg_name>">value</parameter>\n</invoke>\n</function_calls>',
     'Guidelines:',
-    '- one block per call; several blocks are allowed for parallel calls;',
-    '- "arguments" is a JSON object matching the parameters schema;',
-    '- after a [tool_result …] message arrives, continue the task in plain text;',
-    '- earlier [tool_result …] blocks may be truncated or omitted; when the task needs current file or command output, call the tools again instead of guessing from memory;',
+    '- one <invoke> per call; several are allowed inside one <function_calls> for parallel calls;',
+    '- each argument is one <parameter name="...">value</parameter>; the value is plain text, no JSON escaping; for an object or array argument put its JSON inside the parameter;',
+    '- after a <tool_result …> block arrives, continue the task in plain text;',
+    '- earlier <tool_result …> blocks may be truncated or omitted; when the task needs current file or command output, call the tools again instead of guessing from memory;',
     must,
     header,
     specs,
@@ -152,10 +154,10 @@ export function buildToolPreamble(tools, toolChoice, { lite = false, namesOnly =
   return out
 }
 
-const OPEN_TAG = '<tool_call>'
-const CLOSE_TAG = '</tool_call>'
-const OPEN_RE = /<tool_call>/g
-const CLOSE_RE = /<\/tool_call>/g
+const WRAP_OPEN = '<function_calls'
+const WRAP_CLOSE = '</function_calls>'
+const CALL_OPEN = '<invoke'
+const CALL_CLOSE = '</invoke>'
 
 /** Longest suffix of `buf` that is a proper prefix of `tag` (0 if none). */
 function heldPrefixLen(buf, tag) {
@@ -166,58 +168,175 @@ function heldPrefixLen(buf, tag) {
   return 0
 }
 
+/** Value of an XML attribute (`name="Bash"`, `name='Bash'`, or bare). */
+function attrValue(attrs, key) {
+  const re = new RegExp(`\\b${key}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i')
+  const m = re.exec(attrs)
+  return m ? (m[1] ?? m[2] ?? m[3] ?? '') : ''
+}
+
+/** XML text → plain text (named and numeric entities). */
+export function xmlUnescape(s) {
+  return String(s ?? '')
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d)))
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&')
+}
+
+/** Coerce a parameter's text to the type its tool schema declares. */
+function coerceValue(value, schema) {
+  if (!schema || typeof schema !== 'object') return value
+  const type = Array.isArray(schema.type) ? schema.type.find((t) => t !== 'null') : schema.type
+  switch (type) {
+    case 'integer': {
+      const n = Number(String(value).trim())
+      return Number.isInteger(n) ? n : value
+    }
+    case 'number': {
+      const n = Number(String(value).trim())
+      return Number.isFinite(n) ? n : value
+    }
+    case 'boolean': {
+      const v = String(value).trim().toLowerCase()
+      if (v === 'true' || v === '1') return true
+      if (v === 'false' || v === '0') return false
+      return value
+    }
+    case 'array':
+    case 'object': {
+      try { return JSON.parse(String(value)) } catch { return value }
+    }
+    case 'null':
+      return String(value).trim() === '' || String(value).trim().toLowerCase() === 'null' ? null : value
+    default:
+      return value
+  }
+}
+
+/** Parse one `<invoke>` body into {name, arguments}; null when malformed. */
+function parseInvoke(inner, name, schemas) {
+  if (!name) return null
+  const args = {}
+  const re = /<parameter\b([^>]*)>([\s\S]*?)<\/parameter>/gi
+  let m
+  while ((m = re.exec(inner))) {
+    const pname = attrValue(m[1], 'name')
+    if (!pname) return null
+    const schema = schemas.get(String(name).toLowerCase())?.properties?.[pname]
+    args[pname] = coerceValue(xmlUnescape(m[2]), schema)
+  }
+  // anything left must be whitespace: an unclosed parameter or prose is invalid
+  const rest = inner.replace(/<parameter\b([^>]*)>([\s\S]*?)<\/parameter>/gi, '')
+  if (/<parameter\b/i.test(rest) || rest.replace(/\s+/g, '')) return null
+  return { name, arguments: args }
+}
+
+function guessInvokeName(s) {
+  const m = /<invoke\b([^>]*)/i.exec(String(s ?? ''))
+  return m ? attrValue(m[1], 'name') : ''
+}
+
 /**
- * Incremental parser: feed text_delta strings, get back visible text and
- * completed tool calls. Blocks split across deltas are handled — including a
- * tag split mid-token (`<` + `tool_call>…`), which is held back rather than
- * flushed. A dangling <tool_call> at end() is reported via `dropped` ('unterminated'; an unparseable block is 'invalid').
+ * Incremental parser for Anthropic-style XML tool calls:
+ *
+ *   <function_calls>
+ *   <invoke name="Bash">
+ *   <parameter name="command">git status --porcelain</parameter>
+ *   </invoke>
+ *   </function_calls>
+ *
+ * The wrapper is optional. Parameter values are plain text (XML entities
+ * unescaped); an object/array parameter is JSON inside the parameter, coerced
+ * to its declared schema type. Text outside calls is returned as visible text.
+ * A call that is still open at end() is `unterminated`; a malformed invoke or
+ * parameter is `invalid`.
  */
-export function createToolCallParser() {
+export function createToolCallParser({ tools = [] }: { tools?: any[] } = {}) {
+  const schemas = new Map((tools ?? []).map((t) => [String(t.name).toLowerCase(), t.parameters]))
   let buf = ''
-  let inBlock = false
-  let blockJson = ''
+  let inWrapper = false
+  let inCall = false
+  let callName = ''
+  let callBody = ''
   let dropped: string | false = false
   let droppedName = ''
-  const pending: any[] = [] // parsed calls waiting for id assignment
+  const pending: any[] = []
+  let parsed: any[] = []
 
+  const openCall = (tag) => {
+    callName = attrValue(tag, 'name')
+    inCall = true
+    callBody = ''
+  }
+  const closeCall = () => {
+    const call = parseInvoke(callBody, callName, schemas)
+    inCall = false
+    if (call) parsed.push(call)
+    else { dropped ||= 'invalid'; droppedName ||= callName || guessInvokeName(callBody) }
+    callName = ''
+    callBody = ''
+  }
   const drain = () => {
     const text: string[] = []
-    const calls: any[] = []
+    parsed = []
     for (;;) {
-      if (!inBlock) {
-        OPEN_RE.lastIndex = 0
-        const m = OPEN_RE.exec(buf)
-        if (!m) {
-          // Hold back a suffix that could be the start of <tool_call>.
-          const hold = heldPrefixLen(buf, OPEN_TAG)
-          text.push(buf.slice(0, buf.length - hold))
+      if (inCall) {
+        const idx = buf.indexOf(CALL_CLOSE)
+        if (idx < 0) {
+          const hold = heldPrefixLen(buf, CALL_CLOSE)
+          callBody += buf.slice(0, buf.length - hold)
           buf = buf.slice(buf.length - hold)
           break
         }
-        text.push(buf.slice(0, m.index))
-        buf = buf.slice(m.index + m[0].length)
-        inBlock = true
-        blockJson = ''
+        callBody += buf.slice(0, idx)
+        buf = buf.slice(idx + CALL_CLOSE.length)
+        closeCall()
         continue
       }
-      CLOSE_RE.lastIndex = 0
-      const m = CLOSE_RE.exec(buf)
-      if (!m) {
-        // Same holdback for a split </tool_call> — keep it out of blockJson.
-        const hold = heldPrefixLen(buf, CLOSE_TAG)
-        blockJson += buf.slice(0, buf.length - hold)
+      if (inWrapper) {
+        const idxCall = buf.indexOf(CALL_OPEN)
+        const idxClose = buf.indexOf(WRAP_CLOSE)
+        if (idxClose >= 0 && (idxCall < 0 || idxClose < idxCall)) {
+          buf = buf.slice(idxClose + WRAP_CLOSE.length)
+          inWrapper = false
+          continue
+        }
+        if (idxCall >= 0) {
+          const gt = buf.indexOf('>', idxCall)
+          if (gt < 0) { buf = buf.slice(idxCall); break }
+          const tag = buf.slice(idxCall, gt + 1)
+          buf = buf.slice(gt + 1)
+          openCall(tag)
+          continue
+        }
+        const hold = Math.max(heldPrefixLen(buf, CALL_OPEN), heldPrefixLen(buf, WRAP_CLOSE))
+        // wrapper content is markup + whitespace only; drop everything but a
+        // possible split tag at the end
         buf = buf.slice(buf.length - hold)
         break
       }
-      blockJson += buf.slice(0, m.index)
-      buf = buf.slice(m.index + m[0].length)
-      inBlock = false
-      const call = parseCall(blockJson)
-      if (call) calls.push(call)
-      else { dropped ||= 'invalid'; droppedName ||= guessName(blockJson) }
-      blockJson = ''
+      const idxCall = buf.indexOf(CALL_OPEN)
+      const idxWrap = buf.indexOf(WRAP_OPEN)
+      const idx = idxCall < 0 ? idxWrap : idxWrap < 0 ? idxCall : Math.min(idxCall, idxWrap)
+      if (idx < 0) {
+        const hold = Math.max(heldPrefixLen(buf, CALL_OPEN), heldPrefixLen(buf, WRAP_OPEN))
+        text.push(buf.slice(0, buf.length - hold))
+        buf = buf.slice(buf.length - hold)
+        break
+      }
+      if (idx > 0) text.push(buf.slice(0, idx))
+      const gt = buf.indexOf('>', idx)
+      if (gt < 0) { buf = buf.slice(idx); break }
+      const tag = buf.slice(idx, gt + 1)
+      buf = buf.slice(gt + 1)
+      if (tag.toLowerCase().startsWith(WRAP_OPEN)) inWrapper = true
+      else openCall(tag)
     }
-    return { text: text.join(''), calls }
+    return { text: text.join(''), calls: parsed }
   }
 
   return {
@@ -234,16 +353,23 @@ export function createToolCallParser() {
       const r = drain()
       for (const c of r.calls) pending.push(c)
       let tail = r.text
-      if (inBlock) {
-        // unterminated block → not shown to the user
+      if (inCall) {
         dropped ||= 'unterminated'
-        droppedName ||= guessName(blockJson)
-        inBlock = false
-        blockJson = ''
+        droppedName ||= callName || guessInvokeName(callBody)
+        inCall = false
+        callBody = ''
+        buf = ''
+      } else if (inWrapper) {
+        // A missing </function_calls> after a complete invoke is cosmetic; only
+        // an empty, unclosed wrapper is a dropped call.
+        if (!pending.length) dropped ||= 'unterminated'
+        inWrapper = false
         buf = ''
       } else if (buf) {
-        // held-back tag prefix at EOS is just literal text
-        tail += buf
+        if (/^<invoke\b/i.test(buf) || /^<function_calls\b/i.test(buf)) {
+          dropped ||= 'unterminated'
+          droppedName ||= guessInvokeName(buf)
+        } else tail += buf
         buf = ''
       }
       return { text: tail, calls: r.calls, dropped: dropped || undefined, droppedName: droppedName || undefined }
@@ -251,37 +377,6 @@ export function createToolCallParser() {
     /** All calls seen so far (for session bookkeeping). */
     get calls() { return pending },
   }
-}
-
-/** Best-effort tool name out of a block that failed to parse. */
-function guessName(json) {
-  const m = /"name"\s*:\s*"([^"\\]{1,128})"/.exec(json)
-  return m ? m[1] : ''
-}
-
-function parseCall(json) {
-  let obj
-  // The model sometimes wraps the JSON in stray markup — a ```json fence or
-  // an Anthropic-style `</invoke>` before </tool_call> (seen live on a 6 KB
-  // Bash heredoc) — or writes raw newlines/tabs inside long string values
-  // (file contents, heredocs). Try as-is, then the outermost {…} span, each
-  // also with raw control characters escaped.
-  const a = json.indexOf('{')
-  const b = json.lastIndexOf('}')
-  const span = a >= 0 && b > a ? json.slice(a, b + 1) : null
-  for (const cand of [json.trim(), span, escapeRawControls(json.trim()), span && escapeRawControls(span)]) {
-    if (!cand) continue
-    try { obj = JSON.parse(cand); break } catch {}
-  }
-  if (obj === undefined) return null
-  const name = obj?.name ?? obj?.tool ?? obj?.function?.name
-  if (typeof name !== 'string' || !name) return null
-  let args = obj.arguments ?? obj.args ?? obj.input ?? obj.parameters ?? {}
-  if (typeof args === 'string') {
-    try { args = JSON.parse(args) } catch { /* keep string */ }
-  }
-  if (args == null || typeof args !== 'object') args = {}
-  return { name, arguments: args }
 }
 
 /** Assign OpenAI-style ids to parsed calls: call_<rand>. */

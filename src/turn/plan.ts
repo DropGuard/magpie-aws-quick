@@ -21,9 +21,10 @@ import {
 } from '../translate.ts'
 import type { RenderStats } from '../translate.ts'
 import { resolveReuse } from './reuse.ts'
+import type { ThreadEntry } from '../sessions.ts'
 import type { Reuse } from './reuse.ts'
 import { pickTurnImages, createAttachmentFlow, CONTEXT_ATTACHED_NOTE, TOO_LONG_ERR, TOOL_UPLOAD_MIN } from './attachments.ts'
-import { PLAIN_TEXT_NOTE, TOOLS_STILL_APPLY, INVALID_CALL_TOOL, cutNote } from './prompts.ts'
+import { PLAIN_TEXT_NOTE, TOOLS_STILL_APPLY, RELAYED_NOTE, DIRECT_WORK_NOTE, EXACT_STRINGS_NOTE, INVALID_CALL_TOOL, cutNote } from './prompts.ts'
 import { frameRoom, pickPreamble } from '../protocol/frame.ts'
 
 
@@ -36,21 +37,22 @@ export interface TurnContext {
   convo: any[]
   tools: any[]
   mode: string
+  identity: string
+  sessionKey: string
   systemText: string
   base: any
   customPrompt: string
-  /** Tool spec for the FIRST attempt (reuse: reminder + added tools; fresh: full). */
-  preamble: string
+  /** Full tool spec for a fresh thread, or just the added tools on a reused one. */
+  toolsCustom: string
+  /** Short tool convention reminder appended to every user message. */
+  toolsReminder: string
   textCap: number
   textBudget: number
   turnBudget: number
   frameCap: number
-  scope: string
-  hashes: string[]
-  sessionKey: string
   reuse?: Reuse
   /** Entries removed from the store for reuse — returned on failure. */
-  taken: [string, any][]
+  taken: ThreadEntry[]
   stats: RenderStats
   mark: (why: string) => void
   mergeStats: (from: RenderStats | null | undefined) => void
@@ -58,7 +60,7 @@ export interface TurnContext {
   uploadAll: (tid: string) => Promise<{ entries: any[]; failed: number }>
   attachContext: (tid: string) => Promise<any>
   /** Pointer text for a transcript replaced by `entry`, with a recent tail. */
-  attachPointer: (entry: any, headroom: number) => string
+  attachPointer: (attachment: any) => string
   /** Upload one oversized tool result (null when it could not be delivered). */
   uploadToolResult: (tid: string, name: string, text: string) => Promise<any | null>
   imageNoteFor: (failed: number) => string
@@ -102,7 +104,7 @@ export function buildTurnContext({ body, outpost, sessions, options, signal, sys
   const mode = base?.agent_mode || 'smart'
   // Quick's model sometimes calls a client tool through its own native
   // function calling (tool_start → tool_arguments → tool_result) instead of
-  // our <tool_call> text convention; Quick has no such tool, so it errors
+  // our XML <invoke> text convention; Quick has no such tool, so it errors
   // "Unknown tool" and the model rewrites everything as text — one observed
   // request took 285 s that way. consume() salvages those: a tool_arguments
   // event naming a client tool becomes a regular tool_call, then the turn is
@@ -140,7 +142,7 @@ export function buildTurnContext({ body, outpost, sessions, options, signal, sys
   const showQuickTools = options?.showQuickTools !== false
   // custom_prompt is a real per-turn instruction channel (verified live). Use
   // it to tell the model this session is app-driven: with client tools, steer
-  // local-environment work to the <tool_call> protocol; on direct backends
+  // local-environment work to the <invoke> protocol; on direct backends
   // (OAuth / Credential Manager — no outpost, hence no connected device) also
   // say built-in device tools cannot run, so the model doesn't burn agentic
   // turns on guaranteed failures. The local-outpost path may genuinely have a
@@ -148,23 +150,25 @@ export function buildTurnContext({ body, outpost, sessions, options, signal, sys
   const directBackend = !!outpost?.direct
   const baseCustomPrompt = tools.length
     ? directBackend
-      ? 'Calling context: this chat is driven by an external application. The client tools listed in the message are executed by that application on the user\'s machine; this session has no connected device, so built-in device tools (local files, apps) cannot run here. For questions about the user\'s project, files or code, call the client tools to read current contents — earlier tool results may be partial, and a fresh read beats guessing.'
+      ? 'Calling context: this chat is driven by an external application. The client tools listed in the message are executed by that application on the user\'s machine. Quick\'s own built-in tools (its file reader, shell, search) run on a remote service and cannot see that machine; this session has no connected device. For questions about the user\'s project, files or code, call the client tools to read current contents — earlier tool results may be partial, and a fresh read beats guessing.'
       : 'Calling context: this chat is driven by an external application. The client tools listed in the message are executed by that application on the user\'s machine — for questions about the user\'s project, files or code, call them to read current contents; earlier tool results may be partial, and a fresh read beats guessing.'
     : directBackend
-      ? 'Calling context: this chat is driven by an external application and has no connected device. Built-in tools that need the user\'s device (local files, apps) cannot run in this session — say so plainly rather than attempting them.'
+      ? 'Calling context: this chat is driven by an external application and has no connected device. Quick\'s own built-in tools (file reader, shell, search) run on a remote service and cannot see the user\'s machine — say so plainly rather than attempting them.'
       : ''
-  const customPrompt = [baseCustomPrompt, tools.length ? TOOLS_STILL_APPLY : '', PLAIN_TEXT_NOTE].filter(Boolean).join(' ')
-  // protocol/frame.ts owns every byte of this arithmetic.
-  const textCap = frameRoom({ systemText, customPrompt })
+  const customPrompt = [baseCustomPrompt, RELAYED_NOTE, tools.length ? TOOLS_STILL_APPLY : '', directBackend ? DIRECT_WORK_NOTE : '', EXACT_STRINGS_NOTE, PLAIN_TEXT_NOTE].filter(Boolean).join(' ')
+  // Room for the notes plus the tool spec, before the text. The spec travels
+  // in custom_prompt (like the old bridge), not in the user message, so it
+  // does not become part of Quick's conversation history.
+  const roomForTools = frameRoom({ systemText, customPrompt })
 
   const identity = options?.identity || 'local'
-  const { scope, hashes, reuse, taken } = resolveReuse({ sessions, identity, mode, systemText, convo, sessionKey })
+  const { reuse, taken } = resolveReuse({ sessions, identity, convo, sessionKey })
   // The tool spec is the disposable part of the frame: the caller's message
   // (with AGENTS.md and the memory index inside its <system-reminder>) must
   // arrive whole, so the spec compresses first — descriptions before schemas,
   // and only as far as the room requires. protocol/frame.ts owns the ladder.
   const fitPreamble = (list: any[] = tools, need = 0) => {
-    const picked = pickPreamble({ tools: list, toolChoice: body.tool_choice, room: textCap, need })
+    const picked = pickPreamble({ tools: list, toolChoice: body.tool_choice, room: roomForTools, need })
     if (picked.concession) {
       mark('preamble')
       stats.specTier = picked.tier
@@ -177,11 +181,16 @@ export function buildTurnContext({ body, outpost, sessions, options, signal, sys
   // What this thread will have seen once this turn lands.
   const known = reuse?.entry?.toolNames ? new Set(reuse.entry.toolNames) : null
   const added = reuse ? tools.filter((t) => !known?.has(t.name)) : []
-  const preamble = !tools.length ? ''
+  const toolsCustom = !tools.length ? ''
     : !reuse ? fitPreamble(tools, currentTurnNeed)
-      : [added.length ? fitPreamble(added) : '', buildToolPreamble(tools, body.tool_choice, { reminder: true })].filter(Boolean).join('\n\n')
+      : added.length ? fitPreamble(added) : ''
+  // The old bridge appended this short reminder to each user message, where
+  // the model reads it last; the full spec rides in custom_prompt.
+  const toolsReminder = tools.length ? buildToolPreamble(tools, body.tool_choice, { reminder: true }) : ''
   const toolNames = [...new Set([...(reuse ? known ?? [] : []), ...tools.map((t) => t.name)])]
-  const textBudget = Math.max(4 * 1024, textCap - byteLen(preamble))
+  // protocol/frame.ts owns every byte of this arithmetic.
+  const textCap = frameRoom({ systemText, customPrompt: [customPrompt, toolsCustom].filter(Boolean).join('\n\n') })
+  const textBudget = Math.max(4 * 1024, textCap - byteLen(toolsReminder))
 
   // Images ride user_message.attachments: small ones inline as base64 inside
   // the frame; larger ones go through Quick's cloud attachment upload
@@ -194,8 +203,8 @@ export function buildTurnContext({ body, outpost, sessions, options, signal, sys
 
   return {
     convo, tools, mode,
-    systemText, base, customPrompt, preamble, textCap, textBudget, turnBudget, frameCap,
-    scope, hashes, sessionKey, reuse, taken, stats, mark, mergeStats, fitPreamble,
+    systemText, base, customPrompt, toolsCustom, toolsReminder, textCap, textBudget, turnBudget, frameCap,
+    identity, sessionKey, reuse, taken, stats, mark, mergeStats, fitPreamble,
     uploadAll, attachContext, attachPointer, uploadToolResult, imageNoteFor, currentTurnNeed,
     canonClientTool, showQuickTools, images, toolNames, options, signal,
   }
@@ -225,7 +234,7 @@ async function swapBigToolResults(ctx: TurnContext, threadId: string, messages: 
     uploaded.push(entry)
     const id = m.tool_call_id || m.name || 'tool'
     const preview = capMiddle(body, 4096)
-    swapped[i] = { ...m, content: `[tool_result ${id} — ${byteLen(body)} bytes; the full output is in the attached file ${entry.name}. Read that file when the middle of the output matters.]\n${preview}` }
+    swapped[i] = { ...m, content: `[tool output ${id} — ${byteLen(body)} bytes; the full output is in the attached file ${entry.name}. Read that file when the middle of the output matters.]\n${preview}` }
   }
   if (!uploaded.length) return null
   attachments.push(...uploaded)
@@ -255,13 +264,13 @@ export async function composeAttempt(ctx: TurnContext, { threadId, reuse, retry 
     // (same rendering transcript history uses for tool_calls) ahead of the
     // delta, once: the entry written after this turn carries no flag.
     const salvagePrefix = reuse.entry.salvageCalls?.length
-      ? `[Your previous turn was interrupted after you called these tools; the client executed them. Ignore any "Unknown tool" error recorded for them: they run on the client, so keep calling client tools with <tool_call> blocks.]\nassistant: ${renderToolCalls(reuse.entry.salvageCalls)}\n\n`
+      ? `[Your previous turn was interrupted after you called these tools; the client executed them. Ignore any "Unknown tool" error recorded for them: they run on the client, so keep calling client tools with <invoke> blocks.]\nassistant: ${renderToolCalls(reuse.entry.salvageCalls)}\n\n`
       : ''
     const dc = reuse.entry.droppedCall
     const droppedPrefix = dc
-      ? `[Note: your previous <tool_call>${dc.name ? ` for ${dc.name}` : ''} ${dc.reason === 'unterminated'
-        ? 'was cut off before </tool_call>, so the client never ran it. Call it again; if the content is long, split it into several smaller calls (e.g. write the file in parts).'
-        : 'was not valid JSON, so the client never ran it. Call it again with valid JSON (escape newlines and quotes inside strings).'
+      ? `[Note: your previous <invoke>${dc.name ? ` for ${dc.name}` : ''} ${dc.reason === 'unterminated'
+        ? 'was cut off before </invoke>, so the client never ran it. Call it again; if the content is long, split it into several smaller calls (e.g. write the file in parts).'
+        : 'had a missing or malformed parameter, so the client never ran it. Call it again with one <parameter name="...">value</parameter> per argument.'
       } Any error for ${INVALID_CALL_TOOL} below is just the placeholder for that failed call.]\n\n`
       : ''
     const prefix = salvagePrefix + droppedPrefix
@@ -299,7 +308,7 @@ export async function composeAttempt(ctx: TurnContext, { threadId, reuse, retry 
     // History that had to be dropped from the frame is not thrown away: it
     // rides an attachment and the message only points at it.
     if (local.dropped) {
-      let entry = null
+      let entry: any = null
       try {
         entry = await ctx.attachContext(threadId)
       } catch (e: any) {
@@ -307,33 +316,31 @@ export async function composeAttempt(ctx: TurnContext, { threadId, reuse, retry 
         ctx.options?.log?.(`[aws-quick] context attachment failed: ${String(e?.message ?? e).slice(0, 200)}`)
       }
       if (!entry) throw new QuickWsError(TOO_LONG_ERR, { kind: 'too_large', status: 400 })
-      attachments.push(entry)
-      text = ctx.attachPointer(entry, ctx.turnBudget)
+      attachments.push(entry.entry)
+      text = ctx.attachPointer(entry)
       ctx.stats.truncated = true
       contextNote = CONTEXT_ATTACHED_NOTE
     }
   }
-  // The tool convention rides inside the user_message text (there is no
-  // client-tool channel); on reused threads only the short reminder rides,
-  // since every byte of text stays in the thread and counts toward context.
+  // The full tool spec rides in custom_prompt (it does not become part of
+  // Quick's conversation history); a short reminder is appended to the user
+  // message, where the model reads it last.
   // A reused thread already holds the spec of every tool described in it
   // (entry.toolNames), and whatever rides in `text` stays in Quick's history —
   // so later turns get a short reminder, plus the full spec of just the tools
   // added since. Fresh threads, including the stale-thread retry, get the
   // full spec. An entry reloaded from disk without toolNames gets everything
   // once.
-  const preamble = retry
+  const toolSpec = retry
     ? (ctx.tools.length ? ctx.fitPreamble(ctx.tools, ctx.currentTurnNeed) : '')
-    : ctx.preamble
-  let upstreamText = preamble ? `${preamble}\n\n${text}` : text
+    : ctx.toolsCustom
+  // The old bridge kept the tool spec in custom_prompt (not in the user
+  // message, where it would stay in Quick's history) and appended a short
+  // reminder after each user message, where the model reads it last.
+  const custom = [ctx.customPrompt, toolSpec].filter(Boolean).join('\n\n')
+  let upstreamText = ctx.toolsReminder ? `${text}\n\n${ctx.toolsReminder}` : text
   if (byteLen(upstreamText) > ctx.frameCap) {
-    if (retry) {
-      upstreamText = capText(upstreamText, ctx.frameCap)
-    } else {
-      // Last resort before the tail-cutting hard cap: shed the preamble so the
-      // user's message survives intact (tool calling degrades, the answer doesn't).
-      upstreamText = byteLen(text) <= ctx.frameCap ? text : capText(text, ctx.frameCap)
-    }
+    upstreamText = capText(upstreamText, ctx.frameCap)
     ctx.mark('frame')
   }
   if (!upstreamText.trim()) upstreamText = '(empty)'
@@ -341,7 +348,7 @@ export async function composeAttempt(ctx: TurnContext, { threadId, reuse, retry 
   const payload: any = { ...ctx.base, text: upstreamText }
   if (ctx.tools.length) payload.web_search_enabled = false
   if (attachments.length) payload.attachments = attachments
-  const clippedSystem = setInstructions(payload, ctx.systemText, ctx.customPrompt, threadId)
+  const clippedSystem = setInstructions(payload, ctx.systemText, custom, threadId)
   // The runner yields this note before the turn loop, so it must also be part
   // of the client-visible text: the reply we hash has to match what the client
   // stores, or the next turn starts a new thread.

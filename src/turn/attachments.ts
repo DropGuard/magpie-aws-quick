@@ -7,13 +7,13 @@
 // cutting the middle is what made the model "forget" the task).
 import crypto from 'node:crypto'
 import { uploadFile, uploadImage } from '../attach.ts'
-import { renderTranscript, renderTail, textOf, byteLen, capMiddle, canonRole, pickImages } from '../translate.ts'
+import { renderTranscript, textOf, byteLen, canonRole, pickImages } from '../translate.ts'
 
 // A transcript that cannot fit one 64 KB frame travels as a cloud attachment
 // (the desktop upload flow takes text files). Refuse absurd sizes rather than
 // pushing gigabytes at the upload endpoint.
 const MAX_CONTEXT_ATTACHMENT = 32 * 1024 * 1024
-export const CONTEXT_ATTACHED_NOTE = '上下文超过 Quick 64KB 单帧上限，已把完整对话作为附件传给 Quick（模型会先读取该文件）'
+export const CONTEXT_ATTACHED_NOTE = '上下文超过 Quick 64KB 单帧上限，已把最后一条消息之前的对话作为附件传给 Quick（模型会先读取该文件）'
 export const TOO_LONG_ERR = "context_length_exceeded: the conversation does not fit Amazon Quick's 64 KB message limit and uploading it as a context attachment failed"
 // Text room kept free when inline images claim the frame.
 const IMAGE_TEXT_RESERVE = 8 * 1024
@@ -40,10 +40,10 @@ export interface AttachmentFlow {
   imageNoteFor: (failed: number) => string
   /** Deliver the queued uploads into tid's cloud workspace, in parallel. */
   uploadAll: (tid: string) => Promise<{ entries: any[]; failed: number }>
-  /** Upload the full conversation as a text file (null when disabled). */
+  /** Upload the conversation as a text file (null when disabled). */
   attachContext: (tid: string) => Promise<any>
-  /** Pointer text for a transcript replaced by `entry`, with a recent tail. */
-  attachPointer: (entry: any, headroom: number) => string
+  /** Pointer text for a transcript replaced by the attachment, plus the newest message. */
+  attachPointer: (attachment: any) => string
   /** Upload one oversized tool result; null when it could not be delivered. */
   uploadToolResult: (tid: string, name: string, text: string) => Promise<any | null>
 }
@@ -94,7 +94,15 @@ export function createAttachmentFlow({ outpost, options, signal, convo, images }
   // failure (the old bridge behaved this way and stayed usable).
   const attachContext = async (tid: string) => {
     if (options?.contextAttachments === false) return null
-    const full = renderTranscript(convo, '', { lossless: true })
+    // The old bridge uploads the conversation UP TO the last message and keeps
+    // that last message in the frame (when it is short). The model reads the
+    // whole file before acting, so nothing is lost and the current turn is
+    // still visible without a file read.
+    const lastMsg = convo.at(-1)
+    const lastText = lastMsg ? textOf(lastMsg.content) : ''
+    const keepLast = convo.length > 1 && byteLen(lastText) <= 6000
+    const older = keepLast ? convo.slice(0, -1) : convo
+    const full = renderTranscript(older, '', { lossless: true })
     const bytes = Buffer.from(full, 'utf8')
     if (bytes.length > MAX_CONTEXT_ATTACHMENT) {
       throw Object.assign(new Error(`conversation is ${bytes.length} bytes, over the ${MAX_CONTEXT_ATTACHMENT}-byte attachment cap`), { reason: 'size' })
@@ -102,7 +110,7 @@ export function createAttachmentFlow({ outpost, options, signal, convo, images }
     const name = `context_${crypto.randomUUID().slice(0, 8)}.txt`
     const sess = await outpost.session()
     const devId = await Promise.resolve(outpost.outpostId?.()).catch(() => '')
-    return uploadFile({
+    const entry = await uploadFile({
       session: sess,
       name,
       mimeType: 'text/plain',
@@ -115,15 +123,15 @@ export function createAttachmentFlow({ outpost, options, signal, convo, images }
       // compacts) rather than waiting for the idle watchdog
       timeoutMs: Number(options?.contextUploadTimeoutMs) > 0 ? Number(options.contextUploadTimeoutMs) : 120_000,
     })
+    return { entry, last: keepLast ? lastText : '' }
   }
-  // Pointer text for a transcript replaced by `entry`: the most recent turns
-  // are repeated inside the frame, so the model can act without a file read;
-  // the file holds everything older.
-  const attachPointer = (entry: any, headroom: number) => {
-    const lead = `[The conversation so far is in the attached file ${entry.name} (${entry.size} bytes). It was too long to send as one message: older turns are only in that file — read it with your file tool when you need anything before the messages below. The most recent messages are repeated here so you can continue right away.]`
-    const room = Math.max(2 * 1024, headroom - byteLen(lead) - 256)
-    const tail = renderTail(convo, room)
-    return tail ? `${lead}\n\n${tail}` : lead
+  // Pointer text: the conversation up to the last message is in the file; the
+  // last message itself rides in the frame when it was short enough.
+  const attachPointer = (attachment: any) => {
+    const entry = attachment?.entry ?? attachment
+    const last = String(attachment?.last ?? '')
+    const lead = `[The conversation up to the last message is in the attached file ${entry.name} (${entry.size} bytes) because it is too long to send here. Read the whole file with your file tool before anything else, then carry on from it exactly as if its text had been sent in this message. Do not mention the file or that you are reading it.]`
+    return last ? `${lead}\n\n${last}` : lead
   }
   // Best-effort: when the frame had to cut a huge tool result, the full output
   // goes to a file and the frame keeps a pointer. A failed upload falls back to

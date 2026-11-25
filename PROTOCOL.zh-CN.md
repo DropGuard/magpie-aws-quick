@@ -202,10 +202,10 @@ Quick 自有 agent 工具的服务端执行过程，`message_complete.tool_calls
 1. 把 OpenAI `tools[]` + `tool_choice` 渲染成一段 `[Tool-use convention]` 指令，
    拼进 `user_message.payload.text`（协议没有 system-prompt 通道，只能走正文）。
    同时置 `web_search_enabled:false`，减少模型调用自带联网工具"抢答"。
-2. 模型把调用输出为纯文本 `<tool_call>{"name":…,"arguments":{…}}</tool_call>`
+2. 模型把调用输出为纯文本 `<function_calls><invoke name="…"><parameter name="…">value</parameter></invoke></function_calls>`
    （tag 可能跨 `text_delta` 切分，插件做了 holdback 解析，见 `lib/tools.mjs`）。
 3. 解析结果映射为 OpenAI `tool_calls`；`finish_reason:"tool_calls"`。
-4. 客户端回传 `role:"tool"` 结果 → 渲染为 `[tool_result <name> <id>] <content>`
+4. 客户端回传 `role:"tool"` 结果 → 渲染为 `<tool_result tool_use_id="<id>">content</tool_result>`
    续接同一 thread（delta 里只含新增 tool/user 内容）。
 
 局限：依赖模型遵守约定（`tool_choice:'required'` 实测稳定）；模型也可能无视约定

@@ -1,214 +1,130 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import {
-  createSessionStore, chainHashes, sessionScope, findContinuation,
-  extendHash, replyMessage, canonMessage,
-} from '../src/sessions.ts'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { createSessionStore, messageKey, threadKeys } from '../src/sessions.ts'
 
-const scope = sessionScope('acct1', 'smart', 'sys', [])
+const user = (text) => ({ role: 'user', content: text })
+const asst = (text = 'reply') => ({ role: 'assistant', content: text })
+const tool = (id, text) => ({ role: 'tool', tool_call_id: id, name: 'Read', content: text })
 
-test('chainHashes is deterministic and prefix-stable', () => {
-  const msgs = [
-    { role: 'user', content: 'hi' },
-    { role: 'assistant', content: 'hello' },
-    { role: 'user', content: 'next' },
-  ]
-  const h1 = chainHashes(scope, msgs)
-  const h2 = chainHashes(scope, msgs)
-  assert.deepEqual(h1, h2)
-  assert.equal(h1.length, msgs.length + 1)
-  // extending the same prefix keeps earlier hashes identical
-  const h3 = chainHashes(scope, msgs.slice(0, 2))
-  assert.deepEqual(h3, h1.slice(0, 3))
+test('messageKey: assistant is a wildcard, user/tool are content hashes', () => {
+  assert.equal(messageKey(asst('one')), 'assistant')
+  assert.equal(messageKey(asst('two')), 'assistant')
+  assert.equal(messageKey({ role: 'assistant', content: '', tool_calls: [{ id: 'c1' }] }), 'assistant')
+  assert.notEqual(messageKey(user('a')), messageKey(user('b')))
+  assert.notEqual(messageKey(tool('c1', 'a')), messageKey(tool('c1', 'b')))
+  assert.equal(messageKey({ role: 'system', content: 'rules' }), '')
+  assert.equal(messageKey({ role: 'developer', content: 'rules' }), '')
 })
 
-test('scope changes with mode/system/tools/identity', () => {
-  const a = sessionScope('acct1', 'smart', 'sys', [])
-  assert.notEqual(a, sessionScope('acct2', 'smart', 'sys', []))
-  assert.notEqual(a, sessionScope('acct1', 'fast', 'sys', []))
-  assert.notEqual(a, sessionScope('acct1', 'smart', 'other', []))
-  assert.notEqual(a, sessionScope('acct1', 'smart', 'sys', [{ type: 'function' }]))
+test('threadKeys leaves system messages out and keeps the assistant placeholder', () => {
+  const keys = threadKeys([
+    { role: 'system', content: 'rules' },
+    user('hi'),
+    asst('hello'),
+    tool('c1', 'result'),
+  ])
+  assert.equal(keys.length, 3)
+  assert.equal(keys[1], 'assistant')
 })
 
-test('canonMessage tolerates assistant tool_calls and tool results', () => {
-  const a = canonMessage({ role: 'assistant', content: 'x', tool_calls: [{ id: 'c1', function: { name: 'f', arguments: '{"a":1}' } }] })
-  const b = canonMessage({ role: 'assistant', content: 'x', tool_calls: [{ id: 'c1', function: { name: 'f', arguments: '{"a":2}' } }] })
-  assert.equal(a, b) // arguments don't affect identity
-  assert.ok(canonMessage({ role: 'tool', tool_call_id: 'c', content: 'r' }).startsWith('tool|c|'))
-})
-
-test('findContinuation matches an extended conversation', () => {
+test('a thread continues when the client appends user/tool turns', () => {
   const store = createSessionStore()
-  const convo1 = [{ role: 'user', content: 'hi' }]
-  const h1 = chainHashes(scope, convo1)
-  const key = extendHash(h1[h1.length - 1], replyMessage('hello there'))
-  store.set(key, { threadId: 'thread-1' })
+  const turn1 = [user('hi')]
+  store.commit({ threadId: 't1', account: 'acct', session: 's', keys: threadKeys(turn1), toolNames: [] })
 
-  // next request: same prefix + our reply + new user message
-  const convo2 = [
-    { role: 'user', content: 'hi' },
-    { role: 'assistant', content: 'hello there' },
-    { role: 'user', content: 'what now' },
-  ]
-  const h2 = chainHashes(scope, convo2)
-  const cont = findContinuation(store, h2, convo2)
-  assert.ok(cont)
-  assert.equal(cont.entry.threadId, 'thread-1')
-  assert.equal(cont.index, 2)
-  assert.deepEqual(cont.delta, [{ role: 'user', content: 'what now' }])
+  const turn2 = [user('hi'), asst('hello'), user('next')]
+  const hit = store.match({ account: 'acct', session: 's', keys: threadKeys(turn2) })
+  assert.ok(hit)
+  assert.equal(hit.threadId, 't1')
+  assert.equal(hit.keys.length, 2) // user + assistant
+  assert.deepEqual(turn2.slice(hit.keys.length), [user('next')])
 })
 
-test('findContinuation rejects edited history and assistant deltas', () => {
+test('a rewritten assistant reply does not break the thread', () => {
   const store = createSessionStore()
-  const convo1 = [{ role: 'user', content: 'hi' }]
-  const h1 = chainHashes(scope, convo1)
-  store.set(extendHash(h1[1], replyMessage('hello')), { threadId: 't' })
-
-  // edited first message → different hashes → no continuation
-  const edited = [
-    { role: 'user', content: 'hi!' },
-    { role: 'assistant', content: 'hello' },
-    { role: 'user', content: 'next' },
-  ]
-  assert.equal(findContinuation(store, chainHashes(scope, edited), edited), undefined)
-
-  // delta containing an assistant message → rejected (can't append mid-turn)
-  const weird = [
-    { role: 'user', content: 'hi' },
-    { role: 'assistant', content: 'hello' },
-    { role: 'assistant', content: 'another' },
-    { role: 'user', content: 'next' },
-  ]
-  // findContinuation scans i where convo[i-1] is assistant; the only stored key
-  // is after 'hello' — at i=2 convo[1] is assistant but delta=[assistant,user]
-  // contains assistant → rejected. A later i has no stored key.
-  assert.equal(findContinuation(store, chainHashes(scope, weird), weird), undefined)
+  store.commit({ threadId: 't1', account: 'acct', session: 's', keys: threadKeys([user('hi')]), toolNames: [] })
+  const convo = [user('hi'), asst('a completely rewritten reply'), user('next')]
+  const hit = store.match({ account: 'acct', session: 's', keys: threadKeys(convo) })
+  assert.ok(hit)
+  assert.equal(hit.threadId, 't1')
 })
 
-test('store TTL and LRU eviction', () => {
-  let now = 1000
-  const store = createSessionStore({ ttlMs: 100, max: 2, now: () => now })
-  store.set('a', { v: 1 })
-  store.set('b', { v: 2 })
-  store.set('c', { v: 3 }) // evicts 'a' (oldest)
-  assert.equal(store.has('a'), false)
-  assert.equal(store.has('b'), true)
-  now += 200
-  assert.equal(store.has('b'), false) // expired (lazy purge on access)
-  assert.equal(store.has('c'), false)
-  assert.equal(store.size, 0)
+test('edited user/tool history starts a new thread', () => {
+  const store = createSessionStore()
+  store.commit({ threadId: 't1', account: 'acct', session: 's', keys: threadKeys([user('hi')]), toolNames: [] })
+  const edited = [user('hi EDITED'), asst('hello'), user('next')]
+  assert.equal(store.match({ account: 'acct', session: 's', keys: threadKeys(edited) }), undefined)
 })
 
-test('store persists to disk and a fresh instance resumes entries', async () => {
-  const { mkdtempSync, rmSync } = await import('node:fs')
-  const { tmpdir } = await import('node:os')
-  const path = await import('node:path')
-  const dir = mkdtempSync(path.join(tmpdir(), 'magpie-sess-'))
+test('a tail containing an assistant message cannot be appended', () => {
+  const store = createSessionStore()
+  store.commit({ threadId: 't1', account: 'acct', session: 's', keys: threadKeys([user('hi')]), toolNames: [] })
+  const forked = [user('hi'), asst('hello'), asst('another'), user('next')]
+  assert.equal(store.match({ account: 'acct', session: 's', keys: threadKeys(forked) }), undefined)
+})
+
+test('account and session must match', () => {
+  const store = createSessionStore()
+  store.commit({ threadId: 't1', account: 'acct', session: 's', keys: threadKeys([user('hi')]), toolNames: [] })
+  const keys = threadKeys([user('hi'), asst('hello'), user('next')])
+  assert.equal(store.match({ account: 'other', session: 's', keys }), undefined)
+  assert.equal(store.match({ account: 'acct', session: 'other', keys }), undefined)
+  assert.ok(store.match({ account: 'acct', session: 's', keys }))
+})
+
+test('a match is single-use and restore() puts it back', () => {
+  const store = createSessionStore()
+  store.commit({ threadId: 't1', account: 'acct', session: 's', keys: threadKeys([user('hi')]), toolNames: [] })
+  const keys = threadKeys([user('hi'), asst('hello'), user('next')])
+  const hit = store.match({ account: 'acct', session: 's', keys })
+  assert.ok(hit)
+  assert.equal(store.match({ account: 'acct', session: 's', keys }), undefined)
+  store.restore(hit)
+  assert.ok(store.match({ account: 'acct', session: 's', keys }))
+})
+
+test('the longest stored prefix wins', () => {
+  const store = createSessionStore()
+  store.commit({ threadId: 'short', account: 'acct', session: 's', keys: threadKeys([user('hi')]), toolNames: [] })
+  const longer = [user('hi'), asst('a'), user('q1')] // the request it answered ends with a user turn
+  store.commit({ threadId: 'long', account: 'acct', session: 's', keys: threadKeys(longer), toolNames: [] })
+  const hit = store.match({ account: 'acct', session: 's', keys: threadKeys([...longer, asst('b'), user('q2')]) })
+  assert.equal(hit.threadId, 'long')
+})
+
+test('the cache persists and a fresh instance resumes it', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'magpie-threads-'))
   const file = path.join(dir, 'thread-sessions.json')
   try {
-    const s1 = createSessionStore({ file, ttlMs: 60_000 })
-    s1.set('k1', { threadId: 'thread-abc' })
-    s1.set('k2', { threadId: 'thread-def' })
-    // write-through: visible to a new instance immediately (a host may
-    // re-instantiate the store per request; a debounce lost tool-loop turns)
-    const s2 = createSessionStore({ file, ttlMs: 60_000 })
-    assert.equal(s2.take('k1')?.threadId, 'thread-abc')
-    assert.equal(s2.take('k2')?.threadId, 'thread-def')
-    assert.equal(s2.size, 0) // take() claims are persisted too
-    const s3 = createSessionStore({ file, ttlMs: 60_000 })
-    assert.equal(s3.size, 0)
+    const a = createSessionStore({ file })
+    a.commit({ threadId: 't1', account: 'acct', session: 's', keys: threadKeys([user('hi')]), toolNames: ['Read'] })
+    const b = createSessionStore({ file }) // host re-instantiated
+    const hit = b.match({ account: 'acct', session: 's', keys: threadKeys([user('hi'), asst('hello'), user('next')]) })
+    assert.ok(hit)
+    assert.equal(hit.threadId, 't1')
+    assert.deepEqual(hit.toolNames, ['Read'])
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('a stale instance does not clobber entries a faster turn wrote', async () => {
-  const { mkdtempSync, rmSync } = await import('node:fs')
-  const { tmpdir } = await import('node:os')
-  const path = await import('node:path')
-  const dir = mkdtempSync(path.join(tmpdir(), 'magpie-sess-'))
+test('a restored thread is visible to a later instance', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'magpie-threads-'))
   const file = path.join(dir, 'thread-sessions.json')
   try {
-    // Both load the same (empty) file; the second is stale by the time it writes.
-    const a = createSessionStore({ file, ttlMs: 60_000 })
-    const b = createSessionStore({ file, ttlMs: 60_000 })
-    a.set('ka', { threadId: 'thread-a' })
-    b.set('kb', { threadId: 'thread-b' })
-    const c = createSessionStore({ file, ttlMs: 60_000 })
-    assert.equal(c.take('ka')?.threadId, 'thread-a', 'first turn survived')
-    assert.equal(c.take('kb')?.threadId, 'thread-b', 'second turn survived')
+    const a = createSessionStore({ file })
+    a.commit({ threadId: 't1', account: 'acct', session: 's', keys: threadKeys([user('hi')]), toolNames: [] })
+    const b = createSessionStore({ file })
+    const keys = threadKeys([user('hi'), asst('hello'), user('next')])
+    const hit = b.match({ account: 'acct', session: 's', keys })
+    assert.ok(hit)
+    b.restore(hit)
+    const c = createSessionStore({ file })
+    assert.ok(c.match({ account: 'acct', session: 's', keys }))
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
-})
-
-test('a long-lived instance sees entries another instance wrote', async () => {
-  const { mkdtempSync, rmSync } = await import('node:fs')
-  const { tmpdir } = await import('node:os')
-  const path = await import('node:path')
-  const dir = mkdtempSync(path.join(tmpdir(), 'magpie-sess-'))
-  const file = path.join(dir, 'thread-sessions.json')
-  try {
-    const stale = createSessionStore({ file, ttlMs: 60_000 })
-    const fresh = createSessionStore({ file, ttlMs: 60_000 })
-    fresh.set('k1', { threadId: 'thread-1' })
-    // A long-lived instance loaded before that write must still find it.
-    assert.equal(stale.has('k1'), true)
-    assert.equal(stale.take('k1')?.threadId, 'thread-1')
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
-})
-
-test('a take() is not resurrected by another instance writing later', async () => {
-  const { mkdtempSync, rmSync } = await import('node:fs')
-  const { tmpdir } = await import('node:os')
-  const path = await import('node:path')
-  const dir = mkdtempSync(path.join(tmpdir(), 'magpie-sess-'))
-  const file = path.join(dir, 'thread-sessions.json')
-  try {
-    const setup = createSessionStore({ file, ttlMs: 60_000 })
-    setup.set('kx', { threadId: 'thread-x' })
-    const claimer = createSessionStore({ file, ttlMs: 60_000 })
-    const stale = createSessionStore({ file, ttlMs: 60_000 })
-    claimer.take('kx')
-    stale.set('ky', { threadId: 'thread-y' })
-    const after = createSessionStore({ file, ttlMs: 60_000 })
-    assert.equal(after.has('kx'), false, 'claimed entry stays gone')
-    assert.equal(after.take('ky')?.threadId, 'thread-y')
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
-})
-
-test('session-key fallback does not splice a plain follow-up into another chat', async () => {
-  const { resolveReuse } = await import('../src/turn/reuse.ts')
-  const sessions = createSessionStore()
-  const scope = sessionScope('acct', 'smart', 'sys', null)
-  const sk = `sess:${scope}:shared-key`
-  sessions.set(sk, { threadId: 'thread-other', callIds: ['call_a'] })
-  const convo = [
-    { role: 'user', content: 'hello' },
-    { role: 'assistant', content: 'hi' },
-    { role: 'user', content: 'a fresh question after compaction' },
-  ]
-  const d = resolveReuse({ sessions, identity: 'acct', mode: 'smart', systemText: 'sys', convo, sessionKey: 'shared-key' })
-  assert.equal(d.reuse, undefined, 'a plain user message must not resume a colliding session key')
-  assert.equal(sessions.has(sk), true, 'the entry stays for the chat that owns it')
-})
-
-test('session-key fallback resumes tool results that answer this thread', async () => {
-  const { resolveReuse } = await import('../src/turn/reuse.ts')
-  const sessions = createSessionStore()
-  const scope = sessionScope('acct', 'smart', 'sys', null)
-  const sk = `sess:${scope}:owned-key`
-  sessions.set(sk, { threadId: 'thread-ours', callIds: ['call_a'] })
-  const convo = [
-    { role: 'user', content: 'q' },
-    { role: 'assistant', content: 'a' },
-    { role: 'tool', tool_call_id: 'call_a', content: 'result' },
-  ]
-  const d = resolveReuse({ sessions, identity: 'acct', mode: 'smart', systemText: 'sys', convo, sessionKey: 'owned-key' })
-  assert.equal(d.reuse?.entry.threadId, 'thread-ours')
-  assert.equal(d.reuse?.delta.length, 1)
 })

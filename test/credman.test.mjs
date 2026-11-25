@@ -21,7 +21,7 @@ const blob = {
 
 test('sessionFromBlob maps credman fields to session shape', () => {
   const s = sessionFromBlob(blob, 'quickwork-social-x')
-  assert.equal(s.jwt, 'aoa-access-1')
+  assert.equal(s.tokens.access_token, 'aoa-access-1')
   assert.equal(s.ws_host, 'qbs-x.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev')
   assert.equal(s.aws_account_id, '123')
   assert.equal(s.email, 'u@x.com')
@@ -44,7 +44,7 @@ test('mergeForCredWrite keeps app-blob shape with rotated tokens', () => {
   const s = sessionFromBlob(blob, 'tgt')
   s.tokens.refresh_token = 'rt-2'
   s.tokens.access_token = 'aoa-2'
-  s.usable_until = 9999999999
+  s.tokens.expires_at = 9999999999
   const merged = mergeForCredWrite(s)
   assert.equal(merged.refresh_token, 'rt-2')
   assert.equal(merged.access_token, 'aoa-2')

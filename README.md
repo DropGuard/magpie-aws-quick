@@ -72,50 +72,37 @@ Device ids: the desktop app always sends its profile's `device_id` as `outpostId
 ### Thread reuse
 
 Quick keeps conversation history server-side per `thread_id`, but OpenAI
-clients resend the entire transcript on every request. This plugin tracks
-continuations through three tiers, most precise first:
+clients resend the entire transcript on every request. The plugin makes one
+decision:
 
 - **Incremental hash chain** — each request computes `h[k] = H(scope,
-  m1…mk)` over the canonically rendered message list. A cache hit means
-  the client appended to a conversation we already answered, so only the
-  new tail (user turns / tool results) goes upstream; Quick's server-side
-  history supplies the rest and its prompt cache stays warm.
-- **Fuzzy anchors** — when a client extension prunes or rewrites old
-  turns (compaction, history surgery), the strict chain breaks. The
-  plugin then matches position-independent anchors: the echo of our own
-  last reply plus the three messages that preceded it. Position drift
-  from trimming doesn't matter; a rewritten tail still starts fresh.
-- **Gateway session key** — as a last resort, a stable session id the
-  gateway stamps on every request of a chat (magpie's
-  `x-magpie-session` header; OpenAI clients like pi also send their own
-  session-affinity headers) identifies the conversation even when
-  history was rewritten beyond recognition. The entry rewrites itself
-  every turn, so aggressive compaction can't strand it.
-
-Tier order matters: verified content matches always win; the session key
-is only used when both content tiers fail.
-- **Scope isolation** — the chain is namespaced by
-  `H(account, agent_mode, system prompt)`: switching accounts, models or
-  system prompt starts a fresh thread rather than resuming a stale one.
-  Thinking effort is a per-turn field and doesn't split threads; tools are
-  tracked per thread, so a tool added mid-session (Claude Code's ToolSearch,
-  skills) keeps the thread and only the new tool's spec is sent.
+  m1…mk)` over the message list, with an assistant message counted as a
+  placeholder only: its text and tool-call ids are **not** hashed. A client
+  rewriting its own reply (trimming, notes, regenerated ids, dropped
+  thinking) cannot break the chain. A hit means only the new user/tool tail
+  goes upstream; Quick's server-side history supplies the rest.
+- **A new thread only when history itself changed** — an edited or
+  compacted user/tool message changes the chain, so the plugin starts a
+  fresh thread and re-sends the transcript it now has. The old thread no
+  longer describes the client's conversation; continuing it is how a model
+  ends up working from a 500k-token history the client already compacted.
+- **Identity is account + conversation key + message prefix** — the system
+  prompt, agent mode, tool list and thinking effort are not part of it. Claude
+  Code changes its own system prompt mid-session (memory, billing, ToolSearch)
+  or switches model tier; that must not discard the thread.
 - **Failure-safe** — a reused turn that errors or is cancelled (499, content
-  filter, idle timeout) puts its thread back, so the next request still
-  continues it. The session-key fallback only resumes when the new tool
-  results answer calls that thread made, so parallel subagents sharing one
-  session id never splice into each other's threads.
-- **Edit & branch detection** — any change to earlier messages alters the
-  hashes, so edited or branched history can never silently continue a
-  thread that doesn't match; only append-only tails qualify. Cached
-  entries are claimed on use (single-use), so a client retry cannot
-  replay a turn.
-- **Bounded memory** — entries expire after 24h idle (agent sessions pause
-  far longer than that between turns) and the store is LRU-capped at 200
-  threads. The cache persists to `thread-sessions.json` (hashes + thread
-  ids only, no content) so reuse survives plugin reloads; a stale hit is
-  safe — the handler retries once on a fresh thread with the full
-  transcript.
+  filter, idle timeout) puts its thread back, so the next request continues it.
+- **Bounded memory** — entries expire after 24h idle and the store is
+  LRU-capped at 200 threads. The cache persists to `thread-sessions.json`
+  (message-key hashes + thread ids + tool names only, no content), so reuse survives
+  plugin reloads.
+
+This is much simpler than the old three-tier matcher (hash chain + fuzzy
+anchors + session-key fallback) and removes both the cross-chat session-key
+collision and the "resume a stale thread after compaction" behavior. The
+trade-off: after client compaction the old server-side context is gone and the
+model rebuilds state from the compacted history — exactly what
+`magpie-aws-quick-bridge` did, and why its context never grew to 500k.
 
 ### Models: agent_mode, not model ids
 
@@ -174,7 +161,7 @@ See the file header for options (`PROXY_TOKEN` auth recommended).
 
 - **账号登录（Browser OAuth）**: opens `quick.aws.com/sn`, waits on a localhost
   callback, performs client registration + code exchange itself, then stores
-  `{jwt, ws_host, refresh_token, …}` in
+  a unified record `{ tokens: { access_token, refresh_token, id_token, expires_at }, client: { client_id, client_secret, … }, tenant_url, ws_host, actor_arn, … }` in
   `%APPDATA%\magpie-aws-quick\oauth-sessions.json` (Windows) /
   `~/.config/magpie-aws-quick/` (Linux) /
   `~/Library/Application Support/magpie-aws-quick/` (macOS), mode `0600`.
@@ -222,6 +209,14 @@ A few plugin options tune request handling (`magpie plugin options aws-quick '{�
   per-account device id as `outpostId` (see Device ids above); `false` sends
   an empty value.
 - `guardrailRetries` (default `1`): when Quick's server-side content check stops a turn (a canned sentence with usage 0/0), the plugin retries it on the same thread before the client ever sees the block; `0` disables, surfacing the block.
+- `callRetries` (default `1`): when an `<invoke>` block is incomplete or a `<parameter>` is malformed, ask the model to resend it on the same thread first (split large content if needed). Only if that fails does the placeholder `aws_quick_invalid_tool_call` reach the client. It does not retry when prose or valid calls were already streamed, to avoid duplicates.
+- `answerRetries` (default `0`): a turn can finish normally with reasoning but no text and no tool call. Claude Code shows "Thought for Ns" and then an empty assistant message, so the task stalls. The default is a loud 502 — retrying only buys another multi-minute silence. Set it to `1` to ask again on the same thread ("answer now", one effort level lower).
+- `thinkingEffortCap` (default `high`, matching the old bridge): ceiling for a requested thinking effort. `medium`/`high` pass through; only `max` becomes `high`. `'max'` disables the ceiling, `'medium'` is faster.
+- `contextWindow` (default `1000000`, Quick's own value): optional cap on the client's context window. Lowering it makes Claude Code compact earlier, which is usually a bad trade for a file-reading agent.
+
+**Why max is capped by default.** Across 368 measured `max` turns the median output was 2,442 tokens, p90 ~26k and the maximum 63,322 (right at the 64k cap); median turn time was 34 s, p90 4m47s, max 21m49s. The old bridge never sent `max`: it mapped `max/xhigh` to `high` in its gateway. That is a large part of why it was slower but usable.
+
+**64 KB frames and tool results.** One 17k-token Read result is ~68 KB — larger than a whole frame. The plugin must either cut it (the model re-runs the same read) or upload it (the model spends a server-side step reading it back). The tool instructions now ask the client to read in 300–400-line chunks and trim command output with head/tail; that is the only place where the re-read loop can be avoided at the source.
 
 ## FAQ
 
@@ -247,9 +242,9 @@ browser or in a private/incognito window, without signing out of the others.
   server-side toolchain (browser, local files, MCP, …); its `tool_start`/
   `tool_result` events are executed by Quick itself while clients only observe,
   and `message_complete.tool_calls` is always empty. OpenAI `tools` sent by
-  the client are injected as a `<tool_call>{json}</tool_call>` text convention
-  and parsed back into standard `tool_calls`; `tool`-role results render as
-  `[tool_result …]` continuing the same thread. The full tool spec is sent
+  the client are injected as an Anthropic-style `<invoke>/<parameter>` XML
+  convention and parsed back into standard `tool_calls`; `tool`-role results
+  render as `<tool_result …>` blocks continuing the same thread. The full tool spec is sent
   once per thread; later turns on a reused thread carry only a short
   reminder, because everything in the message stays in Quick's thread
   history and counts toward the context. Reliability depends on the
@@ -289,10 +284,12 @@ browser or in a private/incognito window, without signing out of the others.
   server-side (text, instructions and attachments share it). Oversized system prompts /
   tool schemas are compacted automatically (schema de-annotation, tool-spec
   lite then names-only fallback, capped tool results). A fresh thread whose
-  whole transcript cannot fit one frame does not lose its middle: the transcript
-  goes up as a `context_*.txt` attachment through Quick's own upload flow and the
-  message only points at it, so the model reads the full history with its file
-  tool. If the upload fails too, the request errors with 400
+  whole transcript cannot fit one frame does not lose its middle: the
+  conversation up to the last message goes up as a `context_*.txt` attachment
+  through Quick's own upload flow, and the frame keeps a "read the whole file
+  first" pointer. The last message itself rides in the frame when it is under
+  6 KB, so the current turn is visible without a file read. If the upload fails
+  too, the request errors with 400
   `context_length_exceeded` so the client compacts its own history instead of
   working from a silently gutted transcript (`contextAttachments:false` disables
   the upload and keeps the loud 400). Ordinary chat keeps full system instructions when they fit alongside the
@@ -311,7 +308,7 @@ browser or in a private/incognito window, without signing out of the others.
   only in memory; session-cache entries store only hashes + thread ids —
   persisted to `thread-sessions.json` (no message content) so thread reuse
   survives plugin reloads.
-- On the OAuth path, `{jwt, refresh_token, client_secret, …}` is persisted in
+- On the OAuth path, `{type:'oauth', tokens:{access_token, refresh_token, id_token, expires_at}, client:{client_id, client_secret, …}, tenant_url, ws_host, …}` is persisted in
   `oauth-sessions.json` (mode `0600`) — unavoidable for refresh-token
   rotation, equivalent to the desktop app keeping its sign-in in the OS
   credential store. Protect your user profile accordingly.

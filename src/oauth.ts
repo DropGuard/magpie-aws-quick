@@ -67,6 +67,78 @@ function decodeJwt(token) {
   }
 }
 
+/** The bearer a Quick WS/HTTP call uses: id_token first, else access_token. */
+export const bearer = (s: any) => s?.tokens?.id_token || s?.tokens?.access_token || ''
+
+/** Absolute expiry (seconds) of the current token set. */
+export const expiresAt = (s: any) => Number(s?.tokens?.expires_at) || 0
+
+/**
+ * Canonical credential record. It accepts the plugin's current nested shape and
+ * the two legacy shapes (flat `access`/`refresh`/`idToken`/`expires`, and
+ * `jwt`/`usable_until`), so an existing oauth-sessions.json or Credential
+ * Manager blob keeps working. Stored records carry no `jwt`, no `usable_until`
+ * and no relative `expires_in`; those are derived at the transport boundary.
+ *
+ * This is the shape both sign-in paths converge on:
+ *   { type, provider, stage,
+ *     tokens: { access_token, refresh_token, id_token, expires_at },
+ *     client: { client_id, client_secret, issuer_url, token_endpoint, idc_region },
+ *     tenant_url, ws_host, actor_arn, aws_account_id, account_name, email,
+ *     display_name, region, user_info, device_id, obtained_at, discovery }
+ */
+export function normalizeSession(raw: any) {
+  if (!raw || typeof raw !== 'object') return null
+  const tokens = raw.tokens && typeof raw.tokens === 'object' ? raw.tokens : {}
+  const client = raw.client && typeof raw.client === 'object' ? raw.client : {}
+  const discovery = raw.discovery && typeof raw.discovery === 'object' ? raw.discovery : {}
+  const access = String(tokens.access_token ?? raw.access_token ?? raw.access ?? '')
+  const refresh = String(tokens.refresh_token ?? raw.refresh_token ?? raw.refresh ?? '')
+  const idToken = String(tokens.id_token ?? raw.id_token ?? raw.idToken ?? raw.jwt ?? '')
+  const obtainedAt = Number(raw.obtained_at) || 0
+  const expiresIn = Number(tokens.expires_in) || 0
+  let until = Number(tokens.expires_at) || Number(raw.expires_at) || 0
+  if (!until && expiresIn > 0 && obtainedAt > 0) until = obtainedAt + expiresIn
+  if (!until) until = Number(raw.usable_until) || Math.floor(Number(raw.expires) / 1000) || 0
+  let tenant = String(raw.tenant_url ?? raw.tenantUrl ?? discovery.tenant_url ?? '').replace(/\/+$/, '')
+  let wsHost = String(raw.ws_host ?? raw.wsHost ?? '')
+  if (!wsHost && tenant) { try { wsHost = new URL(tenant).host } catch {} }
+  const out: any = {
+    type: 'oauth',
+    provider: String(raw.provider ?? raw.quickProvider ?? 'social'),
+    stage: String(raw.stage ?? 'prod'),
+    tokens: {
+      access_token: access,
+      refresh_token: refresh,
+      id_token: idToken,
+      expires_at: Math.floor(until) || 0,
+    },
+    client: {
+      client_id: String(client.client_id ?? raw.client_id ?? raw.clientId ?? ''),
+      client_secret: String(client.client_secret ?? raw.client_secret ?? raw.clientSecret ?? ''),
+      issuer_url: String(client.issuer_url ?? raw.issuer_url ?? raw.issuerUrl ?? discovery.issuer_url ?? ''),
+      token_endpoint: String(client.token_endpoint ?? raw.token_endpoint ?? raw.tokenEndpoint ?? ''),
+      idc_region: String(client.idc_region ?? raw.idc_region ?? raw.idcRegion ?? discovery.idc_region ?? ''),
+    },
+    tenant_url: tenant,
+    ws_host: wsHost,
+    actor_arn: String(raw.actor_arn ?? raw.actorArn ?? ''),
+    aws_account_id: String(raw.aws_account_id ?? raw.awsAccountId ?? ''),
+    account_name: String(raw.account_name ?? raw.accountName ?? ''),
+    email: String(raw.email ?? ''),
+    display_name: String(raw.display_name ?? raw.displayName ?? ''),
+    region: String(raw.region ?? client.idc_region ?? discovery.idc_region ?? 'us-east-1'),
+    user_info: raw.user_info && typeof raw.user_info === 'object' ? raw.user_info : {},
+  }
+  if (raw.ws_path ?? raw.wsPath) out.ws_path = String(raw.ws_path ?? raw.wsPath)
+  if (raw.device_id) out.device_id = String(raw.device_id)
+  if (obtainedAt) out.obtained_at = obtainedAt
+  if (Object.keys(discovery).length) out.discovery = discovery
+  if (raw._credTarget) out._credTarget = String(raw._credTarget)
+  if (raw._raw) out._raw = raw._raw
+  return out
+}
+
 const oneLine = (v) => String(v ?? '').split(/\s+/).join(' ').trim()
 
 async function postJson(fetchImpl, url, body, headers = {}) {
@@ -197,8 +269,8 @@ export function createSessionStore({ dir }: { dir?: string } = {}) {
   }
   return {
     file,
-    get: (key) => read().accounts[key],
-    set: (key, sess) => { const db = read(); db.accounts[key] = sess; write(db) },
+    get: (key) => { const raw = read().accounts[key]; return raw ? normalizeSession(raw) : undefined },
+    set: (key, sess) => { const db = read(); db.accounts[key] = normalizeSession(sess) ?? sess; write(db) },
     remove: (key) => { const db = read(); delete db.accounts[key]; write(db) },
     list: () => Object.keys(read().accounts),
   }
@@ -299,14 +371,15 @@ export async function refreshSession(sess, { fetchImpl = fetch } = {}) {
   const expiresIn = Number(tok.expiresIn ?? tok.expires_in ?? 0)
   const claims = decodeJwt(idToken)
   const now = Math.floor(Date.now() / 1000)
+  const previous = sess.tokens || {}
+  const expires_at = expiresIn ? now + expiresIn : (Number(claims.exp) || Number(previous.expires_at) || 0)
+  sess.type = 'oauth'
   sess.tokens = {
     access_token: access,
     refresh_token: tok.refreshToken || tok.refresh_token || rt,
-    id_token: idToken,
-    expires_in: expiresIn,
+    id_token: idToken || previous.id_token || '',
+    expires_at,
   }
-  sess.jwt = idToken || access
-  sess.usable_until = expiresIn ? now + expiresIn : (Number(claims.exp) || sess.usable_until || 0)
   sess.obtained_at = now
   // best-effort: refresh the account descriptor too (arn may matter)
   try {
@@ -652,7 +725,7 @@ export function buildSession(p, { stage = 'prod' } = {}) {
   const usable_until = expiresIn ? now + expiresIn : (Number(claims.exp) || 0)
   let actor_arn = p.user_info?.user_arn || ''
   if (!actor_arn && typeof claims.sub === 'string' && claims.sub.startsWith('arn:')) actor_arn = claims.sub
-  return {
+  return normalizeSession({
     provider: 'social',
     stage,
     tenant_url: tenant,
@@ -675,7 +748,7 @@ export function buildSession(p, { stage = 'prod' } = {}) {
       issuer_url: p.discovery?.issuer_url || '',
     },
     discovery: { ...p.discovery },
-  }
+  })
 }
 
 const DEVICE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -747,7 +820,7 @@ export function createDirectBackend({ load, persist, deviceId, fetchImpl = fetch
   let cached = null
   let refreshing = null
   const sncsShape = (s) => ({
-    id_token: s.jwt,
+    id_token: bearer(s),
     ws_host: s.ws_host,
     actor_arn: s.actor_arn || '',
     provider: s.provider || 'social',
@@ -755,7 +828,7 @@ export function createDirectBackend({ load, persist, deviceId, fetchImpl = fetch
     account_name: s.account_name || '',
     tenant_url: s.tenant_url || '',
     region: s.region || 'us-east-1',
-    usable_until: s.usable_until || 0,
+    usable_until: expiresAt(s),
   })
   const backend = {
     direct: true,
@@ -768,12 +841,13 @@ export function createDirectBackend({ load, persist, deviceId, fetchImpl = fetch
     },
     async session() {
       let s = cached || (await load())
-      if (!s?.jwt) throw new OAuthError('session missing — log in again', { status: 401, kind: 'auth' })
+      if (!bearer(s)) throw new OAuthError('session missing — log in again', { status: 401, kind: 'auth' })
       const now = Math.floor(Date.now() / 1000)
-      if (s.usable_until && s.usable_until - now > 120) { cached = s; return sncsShape(s) }
+      const until = expiresAt(s)
+      if (until && until - now > 120) { cached = s; return sncsShape(s) }
       if (!s.tokens?.refresh_token) {
         // no refresh material: try the stored jwt; the server will 401 if dead
-        if (s.jwt) { cached = s; return sncsShape(s) }
+        if (bearer(s)) { cached = s; return sncsShape(s) }
         throw new OAuthError('OAuth session expired and no refresh_token — log in again', { status: 401, kind: 'auth' })
       }
       refreshing ??= refreshSession(s, { fetchImpl }).then(async (fresh) => {
@@ -797,7 +871,7 @@ export function createDirectBackend({ load, persist, deviceId, fetchImpl = fetch
     },
     async status() {
       const s = cached || await Promise.resolve().then(load).catch(() => null)
-      return { logged_in: Boolean(s?.jwt), user: s?.email || s?.display_name || '' }
+      return { logged_in: Boolean(bearer(s)), user: s?.email || s?.display_name || '' }
     },
     async stop() {},
   }

@@ -56,7 +56,7 @@ test('session store save/get/remove round-trip', () => {
     const store = createSessionStore({ dir })
     assert.equal(store.get('k'), undefined)
     store.set('k', { jwt: 'j', ws_host: 'h' })
-    assert.equal(store.get('k').jwt, 'j')
+    assert.equal(store.get('k').tokens.id_token, 'j')
     assert.deepEqual(store.list(), ['k'])
     store.remove('k')
     assert.equal(store.get('k'), undefined)
@@ -67,7 +67,7 @@ test('session store save/get/remove round-trip', () => {
   }
 })
 
-test('buildSession derives ws_host + jwt + usable_until', () => {
+test('buildSession derives ws_host + canonical tokens', () => {
   const sess = buildSession({
     tenant_url: 'https://qbs-x.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev/',
     tokens: { access_token: 'a', refresh_token: 'r', id_token: 'i', expires_in: 3600 },
@@ -76,9 +76,9 @@ test('buildSession derives ws_host + jwt + usable_until', () => {
     discovery: { idc_region: 'us-east-1', issuer_url: 'https://idc/x' },
   })
   assert.equal(sess.ws_host, 'qbs-x.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev')
-  assert.equal(sess.jwt, 'i')
+  assert.equal(sess.tokens.id_token, 'i')
   assert.equal(sess.actor_arn, 'arn:aws:quicksight::1:user/u')
-  assert.ok(sess.usable_until > Math.floor(Date.now() / 1000))
+  assert.ok(sess.tokens.expires_at > Math.floor(Date.now() / 1000))
   assert.equal(sess.client.idc_region, 'us-east-1')
 })
 
@@ -90,7 +90,7 @@ test('full OAuth login flow: callback server + register + exchange + user-info',
     log: () => {},
     timeoutMs: 15000,
   })
-  assert.equal(sess.jwt, 'idt-1')
+  assert.equal(sess.tokens.id_token, 'idt-1')
   assert.equal(sess.ws_host, 'qbs-cell.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev')
   assert.equal(sess.email, 'u@x.com')
   assert.equal(sess.tokens.refresh_token, 'rt-1')
@@ -116,7 +116,7 @@ test('startOAuthLogin returns the sign-in URL before any browser action; done re
   // driving the mock browser against the returned url completes `done`
   await fakeBrowser(url)
   const sess = await done
-  assert.equal(sess.jwt, 'idt-1')
+  assert.equal(sess.tokens.id_token, 'idt-1')
   assert.equal(sess.ws_host, 'qbs-cell.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev')
   assert.equal(sess.email, 'u@x.com')
 })
@@ -157,7 +157,7 @@ test('a stale-nonce or wrong-state callback does not end the login', async () =>
   assert.equal(r2.status, 400)
   await fakeBrowser(url)
   const sess = await done
-  assert.equal(sess.jwt, 'idt-1')
+  assert.equal(sess.tokens.id_token, 'idt-1')
   cancel()
 })
 
@@ -179,7 +179,7 @@ test('submit() completes the login from a pasted hop-2 URL', async () => {
   assert.equal(r1.status, 302)
   const state = new URL(r1.headers.get('location')).searchParams.get('state')
   const sess = await submit(`http://127.0.0.1:${port}/?code=authcode-1&state=${encodeURIComponent(state)}`)
-  assert.equal(sess.jwt, 'idt-1')
+  assert.equal(sess.tokens.id_token, 'idt-1')
   assert.equal((await done).email, 'u@x.com')
   cancel()
 })
@@ -268,7 +268,7 @@ test('startOAuthLogin with saved discovery skips hop 1 and returns the authorize
   // and the pasted hop-2 address still completes the login
   const port = new URL(u.searchParams.get('redirect_uri')).port
   const sess = await submit(`http://127.0.0.1:${port}/?code=authcode-1&state=${encodeURIComponent(u.searchParams.get('state'))}`)
-  assert.equal(sess.jwt, 'idt-1')
+  assert.equal(sess.tokens.id_token, 'idt-1')
   assert.equal((await done).email, 'u@x.com')
   assert.deepEqual(calls.map((c) => c.url.split('/').pop()), ['register', 'token', 'user-info'])
   cancel()
@@ -285,7 +285,7 @@ test('submit() after the flow already completed returns the session', async () =
   // whatever the user pastes now — typically the success page's own address —
   // just hands the finished session back
   const again = await submit('http://127.0.0.1:1/?code=whatever&state=whatever')
-  assert.equal(again.jwt, sess.jwt)
+  assert.equal(again.tokens.id_token, sess.tokens.id_token)
 })
 
 test('login fails cleanly when the callback gets an error', async () => {
@@ -306,7 +306,7 @@ test('refreshSession mints new tokens and keeps rotation', async () => {
     user_info: {}, client_id: 'c', client_secret: 's', discovery: { idc_region: 'us-east-1' },
   })
   await refreshSession(sess, { fetchImpl: mockFetch() })
-  assert.equal(sess.jwt, 'idt-2')
+  assert.equal(sess.tokens.id_token, 'idt-2')
   assert.equal(sess.tokens.refresh_token, 'rt-2') // rotated token persisted
   assert.equal(sess.tokens.access_token, 'at-2')
 })

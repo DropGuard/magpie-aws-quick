@@ -64,6 +64,8 @@ function oversizedConvo() {
   return messages
 }
 
+const xmlCall = (name, args = {}) => `<function_calls><invoke name="${name}">${Object.entries(args).map(([k, v]) => `<parameter name="${k}">${typeof v === 'string' ? v : JSON.stringify(v)}</parameter>`).join('')}</invoke></function_calls>`
+
 async function readSse(res) {
   const text = await res.text()
   const events = []
@@ -226,7 +228,8 @@ test('huge system prompt + large toolset still delivers the user question', asyn
   })
   const p = fake.state.userMessages.at(-1).payload
   assert.ok(p.text.includes('FINAL_QUESTION_MARKER'), 'user question must survive the frame cap')
-  assert.ok(p.text.includes('[Client tool calling]'), 'tool convention must survive too')
+  assert.ok(p.custom_prompt.includes('[Client tool calling]'), 'the tool spec rides in custom_prompt')
+  assert.ok(p.text.includes('Client tool calling — reminder'), 'the short reminder rides in the text')
   assert.ok(frameBytes(p.thread_id, p) <= UPSTREAM_TEXT_LIMIT)
 })
 
@@ -255,16 +258,16 @@ test('thread reuse: extended conversation continues the same thread with delta o
   assert.ok(!t2.payload.text.includes('remember teal'))
 })
 
-test('edited history starts a fresh thread', async () => {
+test('an edited user message starts a fresh thread', async () => {
   const sessions = createSessionStore()
   const u1 = { role: 'user', content: 'alpha' }
   await req({ model: 'fast', messages: [u1] }, { sessions }).then((r) => r.json())
-  // same shape but different content → no continuation
+  // the user's own words changed → this is not the conversation the thread holds
   await req({
     model: 'fast',
     messages: [
-      { role: 'user', content: 'alpha' },
-      { role: 'assistant', content: 'WRONG reply' },
+      { role: 'user', content: 'alpha EDITED' },
+      { role: 'assistant', content: 'reply' },
       { role: 'user', content: 'beta' },
     ],
   }, { sessions }).then((r) => r.json())
@@ -272,7 +275,27 @@ test('edited history starts a fresh thread', async () => {
   assert.notEqual(msgs.at(-1).threadId, msgs.at(-2).threadId)
 })
 
-test('fuzzy resume: pruned early history still continues via reply+tail anchors', async () => {
+test('a rewritten assistant reply still continues the same thread', async () => {
+  const sessions = createSessionStore()
+  await req({ model: 'fast', messages: [{ role: 'user', content: 'alpha' }] }, { sessions }).then((r) => r.json())
+  const first = fake.state.userMessages.at(-1).threadId
+  // Claude Code stores its own rendering of the reply (trimmed text, notes,
+  // regenerated call ids); that must not look like a new conversation.
+  const r = await req({
+    model: 'fast',
+    messages: [
+      { role: 'user', content: 'alpha' },
+      { role: 'assistant', content: 'a rewritten version of the reply' },
+      { role: 'user', content: 'beta' },
+    ],
+  }, { sessions })
+  assert.equal(r.status, 200)
+  await r.json()
+  assert.equal(fake.state.userMessages.at(-1).threadId, first, 'assistant content is a wildcard')
+  assert.equal(fake.state.userMessages.at(-1).payload.text, 'beta', 'only the new turn is appended')
+})
+
+test('a pruned/rewritten history starts a new thread with the full transcript (compaction)', async () => {
   const sessions = createSessionStore()
   const m0 = { role: 'user', content: 'ctx block' }
   const m1 = { role: 'user', content: 'q1' }
@@ -286,8 +309,9 @@ test('fuzzy resume: pruned early history still continues via reply+tail anchors'
   const r2 = await req({ model: 'fast', messages: [m0, m1, a1, m2] }, { sessions })
   const rep2 = (await r2.json()).choices[0].message.content
   const a2 = { role: 'assistant', content: rep2 }
-  // turn 3 — client rewrote the OLDEST message (pi-style context pruning);
-  // strict hash chain breaks, but reply echo + preceding 3 msgs are intact.
+  // turn 3 — the client rewrote the OLDEST message (context pruning or
+  // compaction). The old thread no longer describes this conversation, so the
+  // turn must start a new thread with the transcript it now has.
   const r3 = await req({
     model: 'fast',
     messages: [{ role: 'user', content: 'ctx block REWRITTEN' }, m1, a1, m2, a2, m3],
@@ -297,9 +321,10 @@ test('fuzzy resume: pruned early history still continues via reply+tail anchors'
   const msgs = fake.state.userMessages
   const t2 = msgs.at(-2)
   const t3 = msgs.at(-1)
-  assert.equal(t3.threadId, t2.threadId, 'fuzzy anchors must resume the same thread')
-  assert.equal(t3.payload.text, 'q3')
-  assert.ok(!t3.payload.text.includes('REWRITTEN'))
+  assert.notEqual(t3.threadId, t2.threadId, 'a rewritten history must not resume the old thread')
+  assert.ok(t3.payload.text.includes('q3'), 'the current turn rides along')
+  assert.ok(t3.payload.text.includes('ctx block REWRITTEN'), 'the transcript is rebuilt in full')
+  assert.ok(!t3.payload.text.startsWith('q3'), 'not a delta on top of a stale thread')
 })
 
 test('fuzzy resume rejects when the tail window itself was rewritten', async () => {
@@ -406,8 +431,8 @@ test('tool_call convention: <tool_call> text becomes OpenAI tool_calls', async (
       const tid = p.thread_id
       return [
         { type: 'message_start', payload: { message_id: mid } },
-        { type: 'text_delta', payload: { delta: 'Checking. <tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>' } },
-        { type: 'message_complete', payload: { text: 'Checking. <tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>', message_id: mid } },
+        { type: 'text_delta', payload: { delta: 'Checking. ' + xmlCall('get_weather', { city: 'Paris' }) } },
+        { type: 'message_complete', payload: { text: 'Checking. ' + xmlCall('get_weather', { city: 'Paris' }), message_id: mid } },
       ]
     },
   })
@@ -437,12 +462,13 @@ test('tool_call convention: <tool_call> text becomes OpenAI tool_calls', async (
     assert.equal(msg.tool_calls[0].function.name, 'get_weather')
     assert.deepEqual(JSON.parse(msg.tool_calls[0].function.arguments), { city: 'Paris' })
     // the <tool_call> block must not leak into visible content
-    assert.ok(!msg.content.includes('<tool_call>'))
+    assert.ok(!msg.content.includes('<invoke'))
     assert.ok(msg.content.includes('Checking.'))
-    // upstream text carried the tool preamble
-    const sent = toolFake.state.userMessages.at(-1).payload.text
-    assert.ok(sent.includes('Client tool calling'))
-    assert.ok(sent.includes('get_weather'))
+    // the tool spec travelled in custom_prompt; the text carries the reminder
+    const first = toolFake.state.userMessages.at(-1)
+    assert.ok(first.payload.custom_prompt.includes('Client tool calling'))
+    assert.ok(first.payload.custom_prompt.includes('get_weather'))
+    assert.ok(first.payload.text.includes('Client tool calling — reminder'))
 
     // turn 2: client echoes assistant tool_calls + tool result → same thread, delta only
     const callId = msg.tool_calls[0].id
@@ -465,14 +491,13 @@ test('tool_call convention: <tool_call> text becomes OpenAI tool_calls', async (
     const msgs = toolFake.state.userMessages
     assert.equal(msgs.at(-1).threadId, msgs.at(-2).threadId, 'tool-result turn reuses thread')
     const deltaText = msgs.at(-1).payload.text
-    assert.ok(deltaText.includes('[tool_result'), 'tool result rendered into delta')
+    assert.ok(deltaText.includes('<tool_result'), 'tool result rendered into delta')
     assert.ok(deltaText.includes(callId))
-    assert.ok(!deltaText.includes('weather in Paris?') || deltaText.includes('[tool_result'))
+    assert.ok(!deltaText.includes('weather in Paris?') || deltaText.includes('<tool_result'))
     // the thread already holds the full spec: only the short reminder rides again
     assert.ok(deltaText.includes('Client tool calling — reminder'), 'reused turn carries the reminder')
     assert.ok(deltaText.includes('get_weather'), 'reminder names the tools')
     assert.ok(!deltaText.includes('Tools provided by the client'), 'full spec is not re-sent on a reused thread')
-    assert.ok(byteLen(deltaText) < byteLen(sent), 'reused turn is smaller than the first')
   } finally {
     await toolFake.close()
   }
@@ -481,7 +506,7 @@ test('tool_call convention: <tool_call> text becomes OpenAI tool_calls', async (
 test('streaming tool_call emits tool_calls deltas then tool_calls finish', async () => {
   const f = await startFakeQuick({
     script: () => [
-      { type: 'text_delta', payload: { delta: 'Let me check. <tool_call>{"name":"f","arguments":{"a":1}}</tool_call>' } },
+      { type: 'text_delta', payload: { delta: 'Let me check. ' + xmlCall('f', { a: 1 }) } },
       { type: 'message_complete', payload: { text: 'x', tool_calls: [] } },
     ],
   })
@@ -505,8 +530,9 @@ test('streaming tool_call emits tool_calls deltas then tool_calls finish', async
     const text = await res.text()
     assert.ok(text.includes('"tool_calls"'))
     assert.ok(text.includes('"name":"f"'))
+    assert.ok(text.includes('Let me check.'), 'the rationale before the block reaches the client')
     assert.ok(text.includes('"finish_reason":"tool_calls"'))
-    assert.ok(!text.includes('<tool_call>')) // markup never leaks into SSE
+    assert.ok(!text.includes('<invoke')) // markup never leaks into SSE
     assert.ok(text.trimEnd().endsWith('data: [DONE]'))
   } finally {
     await f.close()
@@ -1117,12 +1143,12 @@ test('after a native salvage, the next reused turn restates the call once, befor
     assert.equal(up2.threadId, f.state.userMessages.at(-2).threadId, 'follow-up must reuse the salvaged thread')
     const txt = up2.payload.text
     const li = txt.indexOf('interrupted after you called these tools')
-    const ci = txt.indexOf('[called tool Write(')
-    const ri = txt.indexOf(`[tool_result ${call.id}`) // reminder preamble also mentions [tool_result …]
+    const ci = txt.indexOf('<invoke name="Write">')
+    const ri = txt.indexOf(`<tool_result tool_use_id="${call.id}"`) // reminder preamble also mentions <tool_result …>
     assert.ok(li !== -1, 'lead-in missing from reused turn')
     assert.ok(ci > li, 'rendered call must follow the lead-in')
     assert.ok(ri > ci, 'tool result must come after the re-stated call')
-    assert.ok(txt.includes('"file_path":"pelican.html"'), 'native args must be rendered')
+    assert.ok(txt.includes('<parameter name="file_path">pelican.html</parameter>'), 'native args must be rendered')
     assert.ok(txt.includes('File created successfully'), 'tool result must still be delivered')
 
     // Turn 3: the flag was consumed — nothing is re-stated.
@@ -1137,7 +1163,7 @@ test('after a native salvage, the next reused turn restates the call once, befor
     const up3 = f.state.userMessages.at(-1)
     assert.equal(up3.threadId, up2.threadId)
     assert.ok(!up3.payload.text.includes('interrupted after you called these tools'), 'prefix must not repeat on the third turn')
-    assert.ok(!up3.payload.text.includes('[called tool Write('))
+    assert.ok(!up3.payload.text.includes('<invoke name="Write">'))
   } finally {
     await f.close()
   }
@@ -1226,7 +1252,7 @@ test('with client tools, custom_prompt keeps the model on its tools after the fo
   }
 })
 
-test('<sources> citations are stripped; a broken <tool_call> is reported and restated on the next reused turn', async () => {
+test('<sources> citations are stripped; a broken <invoke> is reported and restated on the next reused turn', async () => {
   let calls = 0
   const f = await startFakeQuick({
     script: async (p) => {
@@ -1234,7 +1260,7 @@ test('<sources> citations are stripped; a broken <tool_call> is reported and res
       if (calls === 1) {
         return [
           { type: 'text_delta', payload: { delta: 'Done.\n<sources> [x](mem://d5e9) </sou' } },
-          { type: 'text_delta', payload: { delta: 'rces>\nNext. <tool_call>{"name":"Bash","arguments":{"command":"echo</tool_call>' } },
+          { type: 'text_delta', payload: { delta: 'rces>\nNext. <invoke name="Bash"><parameter name="command">echo' } },
           { type: 'message_complete', payload: { text: '' } },
         ]
       }
@@ -1257,7 +1283,7 @@ test('<sources> citations are stripped; a broken <tool_call> is reported and res
     const ph = j1.choices[0].message.tool_calls
     assert.equal(ph.length, 1)
     assert.equal(ph[0].function.name, INVALID_CALL_TOOL)
-    assert.deepEqual(JSON.parse(ph[0].function.arguments), { tool: 'Bash', reason: 'invalid' })
+    assert.deepEqual(JSON.parse(ph[0].function.arguments), { tool: 'Bash', reason: 'unterminated' })
 
     // client answers with its "no such tool" error, as Claude Code does
     const convo2 = [
@@ -1269,7 +1295,7 @@ test('<sources> citations are stripped; a broken <tool_call> is reported and res
     await r2.json()
     const up2 = f.state.userMessages.at(-1)
     assert.equal(up2.threadId, f.state.userMessages.at(-2).threadId, 'reused thread')
-    assert.match(up2.payload.text, /previous <tool_call> for Bash was not valid JSON, so the client never ran it/)
+    assert.match(up2.payload.text, /previous <invoke> for Bash was cut off before <\/invoke>/)
     assert.ok(up2.payload.text.indexOf('[Note:') < up2.payload.text.indexOf('No such tool available'), 'note precedes the placeholder error')
   } finally {
     await f.close()
@@ -1327,8 +1353,8 @@ test('a tool added mid-session or an effort change keeps the thread; only the ne
     const a2 = (await r2.json()).choices[0].message.content
     const [t1, t2] = f.state.userMessages.slice(-2)
     assert.equal(t2.threadId, t1.threadId, 'toolset/effort change must not start a new thread')
-    assert.match(t2.payload.text, /\[Client tool calling\][\s\S]*CronCreate/, 'full spec for the added tool')
-    assert.ok(!/"name":"Read"|### Read|- Read:/.test(t2.payload.text.split('[Client tool calling — reminder]')[0]), 'no full spec re-sent for Read')
+    assert.match(t2.payload.custom_prompt, /\[Client tool calling\][\s\S]*CronCreate/, 'full spec for the added tool rides in custom_prompt')
+    assert.ok(!t2.payload.custom_prompt.includes('"name":"Read"'), 'no full spec re-sent for Read')
     assert.match(t2.payload.text, /reminder[\s\S]*Read, CronCreate/)
 
     // a third turn with the same tools sends only the reminder
@@ -1408,11 +1434,16 @@ test('a fresh thread too large for one frame sends the conversation as an attach
   )
   assert.equal(res.status, 200)
   const payload = fake.state.userMessages.at(-1).payload
-  // The frame keeps a pointer + the current question, not a gutted transcript.
-  assert.match(payload.text, /is in the attached file context_[0-9a-f]{8}\.txt/)
+  // The old bridge shape: the conversation up to the last message is in the
+  // file, and the last message (short enough) rides in the frame beside the
+  // pointer. No task/recap blocks — the model reads the whole file first.
+  assert.match(payload.text, /conversation up to the last message is in the attached file context_[0-9a-f]{8}\.txt/)
   assert.ok(payload.text.includes('FINAL-ASK'), 'the current turn rides along')
-  assert.ok(payload.text.includes('ANSWER-19-'), 'the most recent turns are repeated inline')
-  assert.ok(!payload.text.includes('QUESTION-0-'), 'old turns are not crammed back into the frame')
+  assert.ok(!payload.text.includes('QUESTION-0-'), 'older turns are not crammed back into the frame')
+  assert.ok(!payload.text.includes('[Original task]') && !payload.text.includes('Progress so far'),
+    'no synthetic task/recap blocks')
+  assert.ok(byteLen(JSON.stringify({ type: 'user_message', payload })) <= UPSTREAM_TEXT_LIMIT + 1536,
+    'pointer + last message fit the 64 KB frame')
   // The whole conversation, but no per-block caps, went up as one text file.
   const up = payload.attachments.find((a) => a.type === 'file')
   assert.ok(up, 'a file attachment is declared')
@@ -1611,7 +1642,7 @@ test('the current turn\'s injected instructions arrive whole; the tool spec give
   // Description-only caps are silent by policy (schemas survive, and the cap
   // hits every fresh session's first frame); a schema drop would be stated.
   assert.ok(!said.includes('工具说明过长') && !said.includes('单帧上限'), `silent: ${said}`)
-  assert.ok(payload.text.includes('"required"') || payload.text.includes('"path"'), 'schemas survive')
+  assert.ok(payload.custom_prompt.includes('"required"') || payload.custom_prompt.includes('"path"'), 'schemas survive')
 })
 
 test('a note in the reply does not start a new thread on the next turn', async () => {
@@ -1677,7 +1708,7 @@ test('a dead cached thread is retried once on a fresh thread with the full trans
     assert.ok(reused.payload.text.includes('Client tool calling — reminder'), 'the reused attempt was a delta')
     assert.ok(retried.payload.text.includes('first task') && retried.payload.text.includes('keep going'),
       'the retry carries the whole conversation')
-    assert.ok(retried.payload.text.includes('Tools provided by the client'), 'the retry re-sends the full tool spec')
+    assert.ok(retried.payload.custom_prompt.includes('Tools provided by the client'), 'the retry re-sends the full tool spec')
   } finally {
     await f.close()
   }
@@ -1727,7 +1758,7 @@ test('a guardrail retry on a reused thread keeps this turn\'s tool result', asyn
       turn++
       if (turn === 1) {
         return [
-          { type: 'text_delta', payload: { delta: 'Checking. <tool_call>{"name":"Read","arguments":{"file_path":"a.txt"}}</tool_call>' } },
+          { type: 'text_delta', payload: { delta: 'Checking. ' + xmlCall('Read', { file_path: 'a.txt' }) } },
           { type: 'message_complete', payload: { text: '' } },
         ]
       }
@@ -1762,7 +1793,7 @@ test('a guardrail retry on a reused thread keeps this turn\'s tool result', asyn
     const msgs = f.state.userMessages
     assert.equal(msgs.length, 3, 'first turn, blocked attempt, one retry')
     assert.equal(msgs[2].payload.threadId, msgs[1].payload.threadId, 'retry stays on the reused thread')
-    assert.match(msgs[2].payload.text, /\[tool_result/, 'the delta (tool result) is not lost')
+    assert.match(msgs[2].payload.text, /<tool_result/, 'the delta (tool result) is not lost')
     assert.match(msgs[2].payload.text, /Continue the previous request/, 'the nudge is appended')
   } finally {
     await f.close()
@@ -1777,7 +1808,7 @@ test('a huge tool result on a reused thread is uploaded instead of truncated', a
       turn++
       if (turn === 1) {
         return [
-          { type: 'text_delta', payload: { delta: 'Reading. <tool_call>{"name":"Read","arguments":{"file_path":"big.txt"}}</tool_call>' } },
+          { type: 'text_delta', payload: { delta: 'Reading. ' + xmlCall('Read', { file_path: 'big.txt' }) } },
           { type: 'message_complete', payload: { text: '' } },
         ]
       }
@@ -1962,6 +1993,224 @@ test('medium tool results that the frame had to cut are uploaded too', async () 
     for (const x of ['ONE', 'TWO', 'THREE'].filter((y) => y !== whole[0])) {
       assert.ok(!payload.text.includes(`${x}-MIDDLE`), `uploaded ${x} middle stays in the file`)
     }
+  } finally {
+    await f.close()
+  }
+})
+
+test('a turn that only thinks is retried, and the client gets the answer', async () => {
+  // Observed live: Quick ends a turn with thinking_delta + message_complete
+  // and no text. Claude Code stores an empty assistant message, renders
+  // "Thought for Ns", and the task stalls until the user types again.
+  const f = await startFakeQuick({
+    script: (payload) => {
+      if (!String(payload.text).includes('without writing any answer')) {
+        return [
+          { type: 'message_start', payload: { message_id: 'm1' } },
+          { type: 'thinking_delta', payload: { delta: 'a very long deliberation' } },
+          { type: 'turn_usage', payload: { input_tokens: 100, output_tokens: 4000 } },
+          { type: 'message_complete', payload: { text: '', continuation_expected: false } },
+        ]
+      }
+      return [
+        { type: 'text_delta', payload: { delta: 'answered after the nudge' } },
+        { type: 'turn_usage', payload: { input_tokens: 120, output_tokens: 10 } },
+        { type: 'message_complete', payload: { text: 'answered after the nudge', continuation_expected: false } },
+      ]
+    },
+  })
+  try {
+    const res = await handleChatCompletions({
+      body: { model: 'smart', stream: true, reasoning_effort: 'max', messages: [{ role: 'user', content: 'what is the answer?' }] },
+      outpostMgr: fakeMgr(f),
+      options: { identity: 'empty-retry', answerRetries: 1, log: () => {} },
+    })
+    assert.equal(res.status, 200)
+    const events = await readSse(res)
+    const said = events.map((e) => String(e.choices?.[0]?.delta?.content ?? '')).join('')
+    assert.ok(said.includes('answered after the nudge'), `the retried answer reaches the client: ${said}`)
+    assert.match(said, /空回答/, 'the client is told the first attempt was empty')
+    assert.equal(f.state.userMessages.length, 2, 'one retry on the same thread')
+    const [first, second] = f.state.userMessages
+    assert.equal(second.threadId, first.threadId, 'the retry appends to the same thread')
+    assert.match(second.payload.text, /without writing any answer/)
+    assert.ok(second.payload.text.includes('what is the answer?'), 'the original request is kept')
+    // max is capped to high (the old bridge's ceiling); an empty turn then
+    // drops one level for the retry.
+    assert.equal(first.payload.thinking_effort, 'high')
+    assert.equal(second.payload.thinking_effort, 'medium')
+  } finally {
+    await f.close()
+  }
+})
+
+test('an empty answer after the retry budget fails loudly, never with a blank message', async () => {
+  const f = await startFakeQuick({
+    script: () => [
+      { type: 'thinking_delta', payload: { delta: 'still thinking' } },
+      { type: 'turn_usage', payload: { input_tokens: 100, output_tokens: 4000 } },
+      { type: 'message_complete', payload: { text: '', continuation_expected: false } },
+    ],
+  })
+  try {
+    const res = await handleChatCompletions({
+      body: { model: 'smart', messages: [{ role: 'user', content: 'answer please' }] },
+      outpostMgr: fakeMgr(f),
+      options: { identity: 'empty-exhaust', answerRetries: 1, log: () => {} },
+    })
+    assert.equal(res.status, 502)
+    const body = await res.json()
+    assert.match(body.error.message, /没有给出任何回答/)
+    assert.equal(f.state.userMessages.length, 2, 'original attempt + one retry, then stop')
+  } finally {
+    await f.close()
+  }
+})
+
+test('thinkingEffortCap matches the old bridge: max becomes high by default', async () => {
+  const cases = [
+    { option: undefined, want: 'high' },
+    { option: 'medium', want: 'medium' },
+    { option: 'max', want: 'max' },
+    { option: 'low', want: 'low' },
+  ]
+  for (const { option, want } of cases) {
+    const body = { model: 'smart', messages: [{ role: 'user', content: `cap-${option ?? 'default'}` }], reasoning_effort: 'max' }
+    const res = await req(body, { options: { identity: `cap-${option ?? 'default'}`, ...(option ? { thinkingEffortCap: option } : {}) } })
+    assert.equal(res.status, 200)
+    await res.text()
+    assert.equal(fake.state.userMessages.at(-1).payload.thinking_effort, want, `cap ${option ?? 'default'}`)
+  }
+  // A low request is not raised to the cap.
+  const res = await req({ model: 'smart', messages: [{ role: 'user', content: 'cap-low-request' }], reasoning_effort: 'low' }, { options: { identity: 'cap-low-req' } })
+  assert.equal(res.status, 200)
+  await res.text()
+  assert.equal(fake.state.userMessages.at(-1).payload.thinking_effort, 'low')
+})
+
+test('the old bridge\'s prompt framing is preserved: identity neutralized, relay and language notes sent', async () => {
+  const sys = "You are Claude Code, Anthropic's CLI for Claude.\n    - Billing: $0.003 this request\nDo the work."
+  const res = await req({
+    model: 'fast',
+    messages: [
+      { role: 'system', content: sys },
+      { role: 'user', content: '请检查 src/loader.cpp 里的加载路径，不要翻译文件名。' },
+    ],
+  })
+  assert.equal(res.status, 200)
+  await res.text()
+  const cp = fake.state.userMessages.at(-1).payload.custom_prompt
+  assert.ok(!cp.includes("You are Claude Code"), 'the product identity is replaced')
+  assert.match(cp, /coding agent running in a terminal or editor/)
+  assert.ok(!cp.includes('Billing:'), 'the per-request billing line is dropped')
+  assert.match(cp, /coding agent on the user's machine/)
+  assert.match(cp, /Copy file names, paths, log lines/)
+  assert.match(cp, /never translate them/)
+  assert.ok(cp.includes('Do the work.'), 'the caller\'s rules still arrive')
+})
+
+test('keep_sessions maps to Quick incognito', async () => {
+  const body = { model: 'fast', messages: [{ role: 'user', content: 'hello' }] }
+  const r1 = await req(body, { options: { identity: 'incognito-default' } })
+  await r1.text()
+  assert.equal(fake.state.userMessages.at(-1).payload.incognito, true, 'default is incognito')
+  const r2 = await req(body, { options: { identity: 'incognito-off', keep_sessions: true } })
+  await r2.text()
+  assert.equal(fake.state.userMessages.at(-1).payload.incognito, false, 'keep_sessions lists the chat')
+})
+
+test('a malformed tool call is retried before the client sees the placeholder', async () => {
+  let calls = 0
+  const f = await startFakeQuick({
+    script: () => {
+      calls++
+      if (calls === 1) {
+        return [
+          { type: 'text_delta', payload: { delta: '<invoke name="Bash"><parameter name="command">echo "hi"</invoke>' } },
+          { type: 'message_complete', payload: { text: '' } },
+        ]
+      }
+      return [
+        { type: 'text_delta', payload: { delta: xmlCall('Bash', { command: 'echo hi' }) } },
+        { type: 'message_complete', payload: { text: '' } },
+      ]
+    },
+  })
+  try {
+    const res = await handleChatCompletions({
+      body: { model: 'fast', messages: [{ role: 'user', content: 'run it' }], tools: [fnTool('Bash')] },
+      outpostMgr: fakeMgr(f),
+      sessions: createSessionStore(),
+      options: { identity: 'call-retry-acct', callRetries: 1, log: () => {} },
+    })
+    assert.equal(res.status, 200)
+    const j = await res.json()
+    assert.equal(j.choices[0].finish_reason, 'tool_calls')
+    assert.equal(j.choices[0].message.tool_calls[0].function.name, 'Bash')
+    assert.ok(!JSON.stringify(j).includes(INVALID_CALL_TOOL), 'no placeholder reaches the client')
+    assert.equal(f.state.userMessages.length, 2, 'one internal retry')
+    const [first, second] = f.state.userMessages
+    assert.equal(second.threadId, first.threadId, 'the retry stays on the same thread')
+    assert.match(second.payload.text, /missing or malformed parameter/)
+    assert.match(second.payload.text, /<parameter name=/)
+  } finally {
+    await f.close()
+  }
+})
+
+test('a malformed tool call after the retry budget still yields one placeholder, not a loop', async () => {
+  const f = await startFakeQuick({
+    script: () => [
+      { type: 'text_delta', payload: { delta: '<invoke name="Bash"><parameter name="command">echo "hi"</invoke>' } },
+      { type: 'message_complete', payload: { text: '' } },
+    ],
+  })
+  try {
+    const res = await handleChatCompletions({
+      body: { model: 'fast', messages: [{ role: 'user', content: 'run it' }], tools: [fnTool('Bash')] },
+      outpostMgr: fakeMgr(f),
+      sessions: createSessionStore(),
+      options: { identity: 'call-giveup-acct', callRetries: 1, log: () => {} },
+    })
+    assert.equal(res.status, 200)
+    const j = await res.json()
+    assert.equal(j.choices[0].message.tool_calls[0].function.name, INVALID_CALL_TOOL)
+    assert.match(j.choices[0].message.content, /格式有误/)
+    assert.equal(f.state.userMessages.length, 2, 'original attempt + one retry, then stop')
+  } finally {
+    await f.close()
+  }
+})
+
+test('an empty turn after a guardrail retry asks for an answer automatically', async () => {
+  let turn = 0
+  const f = await startFakeQuick({
+    script: () => {
+      turn++
+      if (turn === 1) return [{ type: 'guardrail_blocked', payload: { message: 'That content did not pass our automated check.' } }]
+      if (turn === 2) return [
+        { type: 'thinking_delta', payload: { delta: 'reading the attachment instead of answering' } },
+        { type: 'message_complete', payload: { text: '' } },
+      ]
+      return [
+        { type: 'text_delta', payload: { delta: 'answered after guardrail and empty turn' } },
+        { type: 'message_complete', payload: { text: 'answered after guardrail and empty turn' } },
+      ]
+    },
+  })
+  try {
+    const res = await handleChatCompletions({
+      body: { model: 'fast', messages: [{ role: 'user', content: 'do the thing' }] },
+      outpostMgr: fakeMgr(f),
+      sessions: createSessionStore(),
+      options: { identity: 'guard-empty-answer', log: () => {} },
+    })
+    assert.equal(res.status, 200)
+    const text = (await res.json()).choices[0].message.content
+    assert.match(text, /answered after guardrail and empty turn/)
+    assert.equal(f.state.userMessages.length, 3, 'original + guardrail retry + answer retry')
+    const threads = f.state.userMessages.map((m) => m.threadId)
+    assert.equal(new Set(threads).size, 1, 'all attempts stay on the same thread')
   } finally {
     await f.close()
   }

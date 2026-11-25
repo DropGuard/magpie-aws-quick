@@ -40,7 +40,12 @@
  *   showQuickTools surface Quick's own tool_start events as [Quick: name] reasoning lines (default true)
  *   stableDeviceId direct sessions send a stable per-account device id as outpostId, like the desktop (default true; false = empty)
  *   contextAttachments  a fresh thread's transcript that cannot fit one 64 KB frame is uploaded as a text attachment the model reads (default true; false = fail that turn with 400 so the client compacts its own history)
+ *   keepSessions  list these chats in Amazon Quick (default false = incognito, out of Quick's chat list and memory; keep_sessions also accepted)
  *   guardrailRetries  how many times a turn stopped by Quick's server-side content check is retried before the client sees it (default 1; 0 = surface the block immediately)
+ *   answerRetries  opt-in retries for a turn that produced reasoning but no answer (default 0 = fail loudly on the first empty answer)
+ *   callRetries  how many times a malformed <invoke> block is asked again before the placeholder reaches the client (default 1)
+ *   thinkingEffortCap  ceiling for a requested thinking effort (default high, matching the old bridge; 'max' disables, 'medium' is faster)
+ *   contextWindow  optional cap on the context size advertised to the client and reported in usage (default 1M, Quick's own; lower it only if you want earlier client compaction)
  *   log          function(line) for plugin diagnostics
  *
  * Models are Quick's agent modes, not raw model ids:
@@ -66,7 +71,7 @@ const BASE = 'https://quick.aws.com/magpie-aws-quick/v1'
 const BASE_MODEL = {
   limit: { context: 1000000, output: 64000 },
   // Quick's own agent tools run server-side; OpenAI-style function calling is
-  // layered on top as a <tool_call> text convention (lib/tools.mjs).
+  // layered on top as an XML <invoke>/<parameter> convention (src/tools.ts).
   tool_call: true,
   api: { url: BASE, npm: '@ai-sdk/openai-compatible' },
   capabilities: {
@@ -361,7 +366,7 @@ export const AwsQuickAuthPlugin = async (_input, options) => {
             if (process.platform === 'win32') {
               try {
                 const sess = await loadCredManSession()
-                if (sess?.jwt) {
+                if (sess && (sess.tokens?.id_token || sess.tokens?.access_token)) {
                   // Exercise the real path once: fresh token returns as-is,
                   // expired token triggers OIDC refresh + credman write-back.
                   const backend = createCredManBackend({ fetchImpl: opts.fetchImpl, log: opts.log })
@@ -411,7 +416,8 @@ export const AwsQuickAuthPlugin = async (_input, options) => {
       async models(provider, { auth }: { auth?: any } = {}) {
         if (auth?.type !== 'api' || !auth.key) return provider.models
         const out = {}
-        for (const m of MODELS) out[m.id] = structuredClone(BASE_MODEL)
+        const context = Number(opts.contextWindow) > 0 ? Number(opts.contextWindow) : BASE_MODEL.limit.context
+        for (const m of MODELS) out[m.id] = { ...structuredClone(BASE_MODEL), limit: { ...BASE_MODEL.limit, context } }
         return out
       },
     },

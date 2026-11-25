@@ -6,27 +6,28 @@
 // text protocol, runs the turn on a cached thread, and re-emits the event
 // stream as chat.completion / chat.completion.chunk.
 //
-// OpenAI `tools` have no wire channel either, but the model emits a
-// caller-defined <tool_call>{json}</tool_call> convention as plain text when
-// the instruction is inline and strong (verified live). src/tools.ts owns the
-// preamble + streaming parser; results return as role:'tool' messages rendered
-// into the next turn's text.
+// OpenAI `tools` have no wire channel either, but the model emits an
+// Anthropic-style XML <invoke>/<parameter> convention as plain text when the
+// instruction is inline and strong. src/tools.ts owns the preamble + streaming
+// parser; results return as role:'tool' messages rendered as <tool_result>
+// blocks in the next turn's text.
 import { QuickSocket, QuickWsError } from './quickws.ts'
 import { OutpostError } from './outpost.ts'
 import { isPermissionReview, prepareReview, materializeReview, readReview } from './review.ts'
 import { profileUsage } from './usage.ts'
 import { buildTurnContext, composeAttempt } from './turn/plan.ts'
 import {
-  consumeTurn, usageFrom, GUARDRAIL_LABEL, GUARDRAIL_RETRY_NUDGE,
+  consumeTurn, usageFrom, droppedItems, GUARDRAIL_LABEL, GUARDRAIL_RETRY_NUDGE,
 } from './turn/consume.ts'
 import type { StreamState, Salvage } from './turn/consume.ts'
 import { createWatchdog } from './turn/watchdog.ts'
 import { rememberTurn, restoreTaken } from './turn/session.ts'
+import { EMPTY_ANSWER_NUDGE, EMPTY_ANSWER_LABEL, EMPTY_ANSWER_ERR, agentNeutral } from './turn/prompts.ts'
 import { errorResponse, errorType, httpStatus, makeId, respondWithItems } from './http/respond.ts'
 import { primeItems } from './http/pump.ts'
 import { nextRetry } from './runtime/retry.ts'
 import {
-  AGENT_MODES, MODELS, modeFor, effortFor, textOf, byteLen,
+  AGENT_MODES, MODELS, modeFor, effortFor, capEffort, lowerEffort, textOf, byteLen,
 } from './translate.ts'
 
 const SURFACE = 'QUICK_WORK_DESKTOP_WINDOWS'
@@ -107,6 +108,36 @@ export function quotaCooldownLeft(identity) {
 /** Test hook: clear all quota windows. */
 export function resetQuotaWindows() { quotaWindows.clear(); quotaRefresh.clear() }
 
+// One turn per client conversation at a time. Clients send the next user
+// message as soon as the previous answer is complete; the plugin may still be
+// committing that turn's session entry (measured: the entry landed at :13,
+// the next request started at :10). Matching then sees a stale prefix, rejects
+// the tail that contains the missing assistant, and starts a fresh thread in
+// the middle of a conversation. A bounded wait closes that window without
+// serializing different conversations.
+const turnLanes = new Map<string, Promise<void>>()
+const LANE_WAIT_MS = 8_000
+
+async function holdTurnLane(key: string) {
+  if (!key) return () => {}
+  const prev = turnLanes.get(key)
+  if (prev) {
+    let timer: any
+    await Promise.race([prev, new Promise<void>((resolve) => { timer = setTimeout(resolve, LANE_WAIT_MS); timer.unref?.() })])
+    clearTimeout(timer)
+  }
+  let resolve!: () => void
+  const held = new Promise<void>((r) => { resolve = r })
+  turnLanes.set(key, held)
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    if (turnLanes.get(key) === held) turnLanes.delete(key)
+    resolve()
+  }
+}
+
 const sockets = new WeakMap() // Outpost → QuickSocket
 
 async function socketFor(outpost, options) {
@@ -138,7 +169,7 @@ async function socketFor(outpost, options) {
  *   {type:'meta', threadId, reused, mode}
  *   {type:'text', text}                 visible answer delta
  *   {type:'reasoning', text}            thinking_delta
- *   {type:'tool_call', id, name, arguments}   parsed <tool_call> block (arguments = JSON string)
+ *   {type:'tool_call', id, name, arguments}   parsed <invoke> block (arguments = JSON string)
  *   {type:'usage', usage}               turn_usage (per message)
  *   {type:'note', text}                 non-fatal oddities worth showing
  *   {type:'done', …}                    terminal bookkeeping
@@ -159,7 +190,7 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
     return
   }
   const ctx = buildTurnContext({ body, outpost, sessions, options, signal, systemText, base })
-  const { convo, tools, scope, hashes, sessionKey, taken, reuse, canonClientTool, showQuickTools } = ctx
+  const { convo, tools, identity, sessionKey, taken, reuse, canonClientTool, showQuickTools } = ctx
   let threadId = reuse ? reuse.entry.threadId : crypto.randomUUID()
   const first = await composeAttempt(ctx, { threadId, reuse })
   let payload = first.payload
@@ -172,7 +203,7 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
   // step server-side, so the session entry carries these and the NEXT reused
   // turn re-states them before the tool results (composeAttempt's reuse branch).
   const salvage: Salvage = { salvageCalls: [], droppedCall: null }
-  const consumeOpts = { tools, canonClientTool, showQuickTools }
+  const consumeOpts = { tools, canonClientTool, showQuickTools, contextWindowCap: Number(options?.contextWindow) > 0 ? Number(options.contextWindow) : 1_000_000 }
 
   yield { type: 'meta', threadId, reused, mode }
   // What the client will store as this assistant message: text chunks and
@@ -211,6 +242,20 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
   // Bounded, same account, and `guardrailRetries: 0` turns it off.
   const guardMax = Math.max(0, Math.floor(msOpt(options?.guardrailRetries, 1)))
   let guardTries = 0
+  // Reasoning-only turns: Quick finishes normally with thinking and no text
+  // and no call. The client stores an empty assistant message, shows
+  // "Thought for Ns", and waits for the user. Retrying this by default would
+  // buy another multi-minute silence, not correctness — so the default is to
+  // fail loudly and let the caller decide (`answerRetries` opts into a retry,
+  // same thread, one effort level lower).
+  const answerMax = Math.max(0, Math.floor(msOpt(options?.answerRetries, 0)))
+  let answerTries = 0
+  // A malformed <invoke> is a protocol failure, not an answer: retry it
+  // inside this request before the client sees the placeholder error. The
+  // observed failure was two "No such tool available" errors in a row for a
+  // Bash call whose JSON had unescaped quotes.
+  const callMax = Math.max(0, Math.floor(msOpt(options?.callRetries, 1)))
+  let callTries = 0
   // A fresh-thread retry is the last attempt: failures from it surface as-is
   // (the old inline copy did exactly that — no guardrail loop on the retry).
   let freshTried = false
@@ -221,6 +266,67 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
           if (o.type === 'text') clientText += o.text
           else if (o.type === 'note') clientText += `\n\n> ${o.text}`
           yield o
+        }
+        // A dropped <invoke> (unterminated, or a bad parameter) is
+        // the one failure the client cannot help with: handing it the
+        // placeholder produces a visible "No such tool available" error and a
+        // whole extra round trip. If nothing else was produced, ask the model
+        // to resend it here, on the same thread, before giving up.
+        if (salvage.droppedCall) {
+          const dc = salvage.droppedCall
+          if (!state.text && !state.calls.length && callTries < callMax && !signal?.aborted) {
+            callTries++
+            const nudge = dc.reason === 'unterminated'
+              ? `Your previous <invoke>${dc.name ? ` for ${dc.name}` : ''} ended before </invoke>, so the client never ran it. Resend it as a complete invoke block; if the content is long, split it into several smaller calls.`
+              : `Your previous <invoke>${dc.name ? ` for ${dc.name}` : ''} had a missing or malformed parameter, so the client never ran it. Resend it with <invoke name="..."> and one <parameter name="...">value</parameter> per argument; split a long command or content into several calls.`
+            const original = String(payload.text ?? '')
+            const nudged = `${original}\n\n${nudge}`
+            payload.text = byteLen(nudged) <= ctx.frameCap ? nudged : original
+            payload.message_id = crypto.randomUUID()
+            salvage.droppedCall = null
+            watchdog.bump()
+            options?.log?.(`[aws-quick] dropped ${dc.reason} tool call; asking for a resend (${callTries}/${callMax})`)
+            const retryNote = `[Quick 工具调用重试] 模型的工具调用${dc.reason === 'unterminated' ? '没写完' : ' JSON 不合法'}，正在要求它重发（${callTries}/${callMax}）`
+            clientText += `\n\n> ${retryNote}`
+            yield { type: 'note', text: retryNote }
+            continue
+          }
+          for (const item of droppedItems(salvage, state)) {
+            if (item.type === 'note') clientText += `\n\n> ${item.text}`
+            yield item
+          }
+          turnOk = true
+          break
+        }
+        // The wire turn ended, but only reasoning arrived. From the client's
+        // side that is an empty assistant message: Claude Code renders
+        // "Thought for Ns" and returns control, so the task silently stalls.
+        // Ask again with an explicit "answer now" and one effort level less;
+        // if the retry is empty too, surface a real error instead of a blank.
+        if (!state.text && !state.calls.length && !signal?.aborted) {
+          // After a guardrail retry, an empty turn is the expected leftover:
+          // the model spent the retry reading/thinking instead of answering.
+          // Ask once more even when answerRetries is 0; the manual "continue"
+          // the user would type is exactly this request. Bounded: guardTries
+          // and answerTries each cap at 1 here.
+          const coupled = guardTries > 0 && answerTries === 0 ? 1 : 0
+          const answerBudget = Math.max(answerMax, coupled)
+          if (answerTries < answerBudget) {
+            answerTries++
+            const original = String(payload.text ?? '')
+            const nudged = `${original}\n\n${EMPTY_ANSWER_NUDGE}`
+            payload.text = byteLen(nudged) <= ctx.frameCap ? nudged : original
+            payload.message_id = crypto.randomUUID()
+            const lower = lowerEffort(payload.thinking_effort)
+            if (lower) payload.thinking_effort = lower
+            watchdog.bump()
+            options?.log?.(`[aws-quick] turn produced reasoning only; asking for an answer (${answerTries}/${answerBudget}, effort ${payload.thinking_effort ?? 'default'})`)
+            const retryNote = `${EMPTY_ANSWER_LABEL}模型只推理、没有作答，正在要求它直接回答（${answerTries}/${answerBudget}）`
+            clientText += `\n\n> ${retryNote}`
+            yield { type: 'note', text: retryNote }
+            continue
+          }
+          throw new QuickWsError(EMPTY_ANSWER_ERR, { kind: 'empty' })
         }
         turnOk = true
         break
@@ -280,7 +386,7 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
 
   // Remember where this conversation stands for the next request.
   if (sessions && (state.text || state.calls.length)) {
-    rememberTurn({ sessions, scope, hashes, convo, sessionKey, threadId, toolNames, clientText, state, salvage })
+    rememberTurn({ sessions, convo, identity, sessionKey, threadId, toolNames, salvage })
   } else if (sessions) restoreTaken(sessions, taken)
   yield { type: 'done', threadId, text: state.text, reasoning: state.reasoning, usage: state.usage }
 }
@@ -304,13 +410,25 @@ export async function handleChatCompletions({ body, outpostMgr, sessions, option
   }
   const model = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : 'smart'
   const messages = body.messages
-  const systemText = messages.filter(m => m.role === 'system' || m.role === 'developer').map(m => textOf(m.content)).join('\n\n')
+  const systemText = agentNeutral(messages.filter(m => m.role === 'system' || m.role === 'developer').map(m => textOf(m.content)).join('\n\n'))
   const mode = modeFor(model)
-  const effort = effortFor(effortHeader, body)
+  const requestedEffort = effortFor(effortHeader, body)
+  // The old bridge never sent Quick's `max`: anything above medium became
+  // `high` (measured there as usable, while the fork's pass-through `max`
+  // produced 50–63k-token turns of 8–22 minutes). Mirror that default; a
+  // caller that really wants max can set `thinkingEffortCap: 'max'`.
+  const effort = capEffort(requestedEffort, options?.thinkingEffortCap ?? 'high')
+  if (requestedEffort && effort !== requestedEffort) {
+    options?.log?.(`[aws-quick] thinking effort ${requestedEffort} capped to ${effort} (thinkingEffortCap)`)
+  }
   const base: any = {
     message_id: crypto.randomUUID(), agent_mode: mode,
     user_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
     user_locale: (Intl.DateTimeFormat().resolvedOptions().locale || 'en-US').replace('_', '-'),
+    // The old bridge's keep_sessions switch (snake_case is what its settings
+    // use): off by default means incognito, i.e. the chat stays out of Quick's
+    // list and memory. Send it explicitly so the server does not choose.
+    incognito: !(options?.keepSessions === true || options?.keep_sessions === true),
   }
   if (effort) base.thinking_effort = effort
   if (options?.chatAgentId) base.chat_agent_id = options.chatAgentId
@@ -354,6 +472,11 @@ export async function handleChatCompletions({ body, outpostMgr, sessions, option
     if (e?.kind === 'quota' || e?.status === 429) quotaMarkExhausted(identity, () => outpost.session(), options?.log)
     return e
   }
+  // Acquire BEFORE runTurn: buildTurnContext (the thread match) runs on the
+  // first pull. Release via respondWithItems' onSettled, which fires after the
+  // stream ends — by then rememberTurn has committed this turn's entry.
+  const laneKey = !review && options?.sessionKey ? `${identity}|${options.sessionKey}` : ''
+  const releaseLane = await holdTurnLane(laneKey)
   const it = runTurn({ outpost, socket, body, systemText, base, review, sessions, options, signal })
 
   // Pull up to the first real output before answering so auth/session failures
@@ -366,6 +489,7 @@ export async function handleChatCompletions({ body, outpostMgr, sessions, option
       headerWaitMs: msOpt(options?.headerWaitMs, 10_000),
     })
   } catch (e) {
+    releaseLane()
     noteQuota(e)
     return errorResponse(httpStatus(e), e?.message ?? String(e), errorType(e))
   }
@@ -380,6 +504,7 @@ export async function handleChatCompletions({ body, outpostMgr, sessions, option
     includeUsage: !!body.stream_options?.include_usage,
     onError: noteQuota,
     onCancel: () => { items.return?.(); it.return?.() },
+    onSettled: releaseLane,
   })
 }
 

@@ -174,7 +174,7 @@ export async function profileUsage(getSession, { fetchImpl, signal }: { fetchImp
   try {
     const sess = await getSession()
     const tenant = String(sess?.tenant_url || '').replace(/\/+$/, '')
-    const bearer = sess?.id_token || sess?.jwt || sess?.tokens?.access_token
+    const bearer = sess?.id_token || sess?.tokens?.id_token || sess?.tokens?.access_token || sess?.jwt
     if (!tenant || !bearer) return { error: 'Amazon Quick 会话不可用，无法查询用量' }
     const f = fetchImpl ?? ((...a: Parameters<typeof fetch>) => globalThis.fetch(...a))
     const r = await f(`${tenant}/integration/quick-work/qbs-event`, {
