@@ -1599,3 +1599,46 @@ test('the current turn\'s injected instructions arrive whole; the tool spec give
   const said = events.map((e) => String(e.choices?.[0]?.delta?.content ?? '')).join('')
   assert.match(said, /工具说明过长/)
 })
+
+test('a note in the reply does not start a new thread on the next turn', async () => {
+  // The client stores the note as part of the assistant message, so the reply
+  // we hash must contain it. Before this, every note broke the chain: a
+  // subagent whose first turn was noted re-threaded on every subsequent turn,
+  // and a long conversation that attached its transcript re-attached forever.
+  const sessions = createSessionStore()
+  const bigTools = Array.from({ length: 14 }, (_, i) => ({
+    type: 'function',
+    function: {
+      name: `Tool${i}`,
+      description: `Does the ${i}th thing. ` + 'd'.repeat(1500),
+      parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+    },
+  }))
+  const rules = '<system-reminder>Codebase and user instructions are shown below. IMPORTANT: These instructions OVERRIDE any default behavior. ' + 'r'.repeat(16000) + ' RULES-TAIL</system-reminder>'
+  const sys = 'Rule with a "quote" and a tab\there.\n'.repeat(560)
+  const convo1 = [{ role: 'system', content: sys }, { role: 'user', content: rules + '\n\nDo it.' }]
+  // If this turn needs the transcript as an attachment, serve the upload
+  // locally: the fake Quick speaks WS only.
+  const attachFetch = async (url) => {
+    const u = String(url)
+    if (u.includes('upload-attachment')) return j({ attachmentId: 'att-note' })
+    if (u.includes('attachment-dlp-status')) return j({ dlpJobStatus: 'COMPLETED', policyAction: 'ALLOW' })
+    if (u.includes('qbs-event')) return j({ eventResponse: { invokeAgentResponse: { api_response: { status: 200, body: { path: '/p' } } } } })
+    return j({ error: 'unexpected' }, 404)
+  }
+  const call = (messages) => handleChatCompletions({
+    body: { model: 'fast', messages, tools: bigTools },
+    outpostMgr,
+    sessions,
+    options: { identity: 'note-reuse', log: () => {}, fetchImpl: attachFetch },
+  })
+
+  const j1 = await (await call(convo1)).json()
+  const content = j1.choices[0].message.content
+  assert.match(content, /工具说明过长/, 'the first turn is noted')
+  const thread1 = fake.state.userMessages.at(-1).threadId
+
+  const convo2 = [...convo1, { role: 'assistant', content }, { role: 'user', content: 'next step' }]
+  await (await call(convo2)).json()
+  assert.equal(fake.state.userMessages.at(-1).threadId, thread1, 'the same thread continues')
+})
