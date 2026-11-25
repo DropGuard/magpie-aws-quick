@@ -1569,3 +1569,33 @@ test('guardrailRetries:0 keeps the old behaviour (no extra turn)', async () => {
     await f.close()
   }
 })
+
+test('the current turn\'s injected instructions arrive whole; the tool spec gives way', async () => {
+  // Claude Code's opening message carries AGENTS.md / the memory index inside a
+  // <system-reminder>. Squeezing that block silently made the model believe its
+  // rules had been truncated and spend a turn re-reading them. The spec is the
+  // disposable part of the frame, so it degrades instead.
+  const bigTools = Array.from({ length: 14 }, (_, i) => ({
+    type: 'function',
+    function: {
+      name: `Tool${i}`,
+      description: `Does the ${i}th kind of thing. ` + 'd'.repeat(1500),
+      parameters: { type: 'object', properties: { path: { type: 'string', description: 'p'.repeat(600) } }, required: ['path'] },
+    },
+  }))
+  const reminder = '<system-reminder>HEAD-OF-RULES ' + 'r'.repeat(9700) + ' REMINDER-MIDDLE ' + 'r'.repeat(9700) + ' TAIL-OF-RULES</system-reminder>'
+  // A real Claude Code request also carries ~13.8 KB of system prompt; without
+  // it the frame has room and nothing needs to give way.
+  const system = 'Rule with a "quote" and a tab\there.\n'.repeat(560)
+  const messages = [{ role: 'system', content: system }, { role: 'user', content: `${reminder}\n\nDo the thing.` }]
+  const res = await req({ model: 'fast', stream: true, messages, tools: bigTools })
+  assert.equal(res.status, 200)
+  const payload = fake.state.userMessages.at(-1).payload
+  assert.ok(payload.text.includes('REMINDER-MIDDLE'), 'the injected instructions survive intact')
+  assert.ok(payload.text.includes('TAIL-OF-RULES'))
+  assert.ok(!payload.text.includes('middle omitted'), 'nothing was silently cut')
+  assert.ok(payload.text.includes('Do the thing.'))
+  const events = await readSse(res)
+  const said = events.map((e) => String(e.choices?.[0]?.delta?.content ?? '')).join('')
+  assert.match(said, /工具说明过长，已降级为精简版/)
+})
