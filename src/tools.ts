@@ -12,12 +12,12 @@
 // text, and surface them as OpenAI tool_calls. Results come back as role:'tool'
 // messages, rendered into the next turn's text by renderDelta.
 
-import { byteLen } from './translate.mjs'
+import { byteLen } from './translate.ts'
 
 /** OpenAI tools[] → compact spec list (function tools only). */
 export function normalizeTools(tools) {
   if (!Array.isArray(tools)) return []
-  const out = []
+  const out: any[] = []
   for (const t of tools) {
     const fn = t?.function ?? t
     if (!fn || typeof fn.name !== 'string' || !fn.name) continue
@@ -176,13 +176,13 @@ export function createToolCallParser() {
   let buf = ''
   let inBlock = false
   let blockJson = ''
-  let dropped = false
+  let dropped: string | false = false
   let droppedName = ''
-  const pending = [] // parsed calls waiting for id assignment
+  const pending: any[] = [] // parsed calls waiting for id assignment
 
   const drain = () => {
-    const text = []
-    const calls = []
+    const text: string[] = []
+    const calls: any[] = []
     for (;;) {
       if (!inBlock) {
         OPEN_RE.lastIndex = 0

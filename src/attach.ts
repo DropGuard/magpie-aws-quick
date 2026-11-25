@@ -13,7 +13,7 @@ import crypto from 'node:crypto'
 const DLP_DONE = new Set(['COMPLETED', 'SKIPPED', 'NOT_APPLICABLE'])
 const DLP_FAIL = new Set(['FAILED', 'ERROR'])
 
-function fail(reason, message, status) {
+function fail(reason: string, message: string, status?: any) {
   const e = new Error(message)
   e.reason = reason
   if (status) e.status = status
@@ -22,7 +22,7 @@ function fail(reason, message, status) {
 
 const isAbort = (e, signal) => signal?.aborted || e?.name === 'AbortError'
 
-const sleep = (ms, signal) => new Promise((resolve, reject) => {
+const sleep = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
   if (signal?.aborted) return reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
   const onAbort = () => { clearTimeout(t); reject(Object.assign(new Error('aborted'), { name: 'AbortError' })) }
   const t = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve() }, ms)
@@ -175,7 +175,17 @@ export async function uploadFile({ session, name, mimeType = 'application/octet-
 }
 
 /** Upload one inline image ({mimeType, data(base64)}) — the image shorthand. */
-export function uploadImage({ session, image, name, threadId, outpostId, fetchImpl, signal, pollMs, maxPolls }) {
+export function uploadImage({ session, image, name, threadId, outpostId, fetchImpl, signal, pollMs, maxPolls }: {
+  session: any
+  image: any
+  name?: string
+  threadId: string
+  outpostId?: string
+  fetchImpl?: typeof fetch
+  signal?: AbortSignal
+  pollMs?: number
+  maxPolls?: number
+}) {
   return uploadFile({
     session,
     name: name || 'image',

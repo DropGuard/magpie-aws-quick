@@ -23,7 +23,9 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 
 export class OAuthError extends Error {
-  constructor(message, { status, kind } = {}) {
+  kind: any
+  status: any
+  constructor(message: string, { status, kind }: { status?: any; kind?: string } = {}) {
     super(message)
     this.name = 'OAuthError'
     this.status = status
@@ -171,7 +173,7 @@ export function defaultStoreDir() {
  * Persisting refresh tokens locally is required — OIDC refresh tokens can
  * rotate, so refreshed credentials must survive a magpie restart.
  */
-export function createSessionStore({ dir } = {}) {
+export function createSessionStore({ dir }: { dir?: string } = {}) {
   const d = dir || defaultStoreDir()
   const file = path.join(d, 'oauth-sessions.json')
   const read = () => {
@@ -313,12 +315,12 @@ export async function refreshSession(sess, { fetchImpl = fetch } = {}) {
 
 // ------------------------------------------------------------ login flow ----
 
-function freePort() {
-  return new Promise((resolve, reject) => {
+function freePort(): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
     const s = createServer()
     s.once('error', reject)
     s.listen(0, '127.0.0.1', () => {
-      const { port } = s.address()
+      const { port } = s.address() as import('node:net').AddressInfo
       s.close(() => resolve(port))
     })
   })
@@ -377,7 +379,22 @@ function parsePastedQuery(pasted) {
  *                                  (default: platform config dir)
  * @param {Function} [p.log]
  */
-export async function startOAuthLogin({ stage = 'prod', port, timeoutMs = LOGIN_TIMEOUT_MS, signal, fetchImpl = fetch, log = () => {}, appVersion = APP_VERSION, surface = SURFACE, discovery: presetDiscovery, dir = defaultStoreDir() } = {}) {
+/** Options for startOAuthLogin (every field optional; prod defaults apply). */
+export interface StartLoginOptions {
+  stage?: string
+  port?: number
+  timeoutMs?: number
+  signal?: AbortSignal
+  fetchImpl?: typeof fetch
+  log?: (msg: string) => void
+  appVersion?: string
+  surface?: string
+  discovery?: any
+  dir?: string
+  openBrowser?: (url: string) => any
+}
+
+export async function startOAuthLogin({ stage = 'prod', port, timeoutMs = LOGIN_TIMEOUT_MS, signal, fetchImpl = fetch, log = () => {}, appVersion = APP_VERSION, surface = SURFACE, discovery: presetDiscovery, dir = defaultStoreDir() }: StartLoginOptions = {}) {
   const state = rand()
   const nonce = rand()
   const { verifier, challenge } = pkce()
@@ -388,7 +405,7 @@ export async function startOAuthLogin({ stage = 'prod', port, timeoutMs = LOGIN_
   const redirectUri = `http://127.0.0.1:${listenPort}`
   const scopes = SOCIAL_SCOPES[stage] || SOCIAL_SCOPES.prod
 
-  const params = { discovery: {}, client_id: '', client_secret: '', tokens: {}, user_info: {}, tenant_url: '' }
+  const params: any = { discovery: {}, client_id: '', client_secret: '', tokens: {}, user_info: {}, tenant_url: '' }
 
   // cancel() and an outer AbortSignal share the one abort path.
   const ac = new AbortController()
@@ -402,7 +419,7 @@ export async function startOAuthLogin({ stage = 'prod', port, timeoutMs = LOGIN_
   done.catch(() => {}) // an un-awaited done must not trip unhandledRejection
 
   let submit
-  const started = new Promise((resolve, reject) => {
+  const started = new Promise<string>((resolve, reject) => {
     let finished = false
     // A failure before the listen callback rejects startOAuthLogin itself;
     // after it, only `done` (paramsDone) rejects — resolve(url) already ran.
@@ -609,7 +626,7 @@ export async function startOAuthLogin({ stage = 'prod', port, timeoutMs = LOGIN_
  * @param {object} p  same options as startOAuthLogin, plus:
  * @param {Function} [p.openBrowser] injectable browser opener (tests; may return the URL)
  */
-export async function runOAuthLogin(opts = {}) {
+export async function runOAuthLogin(opts: StartLoginOptions = {}) {
   const { url, done } = await startOAuthLogin(opts)
   const open = opts.openBrowser ?? defaultOpen
   const log = opts.log ?? (() => {})
@@ -698,7 +715,7 @@ export function keyForSession(sess) {
  * accountId: display names and AWS account ids are not unique per user, and
  * two accounts sharing one would be merged by magpie's settle().
  */
-export function accountIdentity(sess, key) {
+export function accountIdentity(sess, key?: string) {
   const email = typeof sess?.email === 'string' && sess.email.includes('@') ? sess.email : ''
   const account = sess?.email || sess?.display_name || sess?.aws_account_id || ''
   return { accountId: email || key || '', metadata: { account, ...(email ? { email } : {}) } }
@@ -717,7 +734,13 @@ export function accountIdentity(sess, key) {
  * `load()` returns the persisted session record (or null); `persist(sess)`
  * writes it back after a refresh so rotated tokens survive restarts.
  */
-export function createDirectBackend({ load, persist, deviceId, fetchImpl = fetch, log = () => {} }) {
+export function createDirectBackend({ load, persist, deviceId, fetchImpl = fetch, log = () => {} }: {
+  load: () => any
+  persist?: (sess: any) => any
+  deviceId?: (sess: any) => any
+  fetchImpl?: typeof fetch
+  log?: (msg: string) => void
+}) {
   let cached = null
   let refreshing = null
   const sncsShape = (s) => ({

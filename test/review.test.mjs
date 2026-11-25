@@ -1,9 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { handleChatCompletions } from '../lib/handler.mjs'
-import { startFakeQuick } from './helpers/fake-quick.mjs'
-import { createSessionStore } from '../lib/sessions.mjs'
-import { frameBytes, UPSTREAM_TEXT_LIMIT } from '../lib/translate.mjs'
+import { handleChatCompletions } from '../src/handler.ts'
+import { startFakeQuick } from './helpers/fake-quick.ts'
+import { createSessionStore } from '../src/sessions.ts'
+import { frameBytes, UPSTREAM_TEXT_LIMIT } from '../src/translate.ts'
 
 const schema = 'You are a security monitor for autonomous AI coding agents.\nApply the application policy. Report the result in a <block> field.'
 const evidence = '<transcript>\nlocal fixture\n</transcript>'

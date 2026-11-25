@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import {
   createSessionStore, chainHashes, sessionScope, findContinuation,
   extendHash, replyMessage, canonMessage,
-} from '../lib/sessions.mjs'
+} from '../src/sessions.ts'
 
 const scope = sessionScope('acct1', 'smart', 'sys', [])
 

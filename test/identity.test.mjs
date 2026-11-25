@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { accountIdentity, keyForSession } from '../lib/oauth.mjs'
+import { accountIdentity, keyForSession } from '../src/oauth.ts'
 
 test('accountIdentity: email becomes accountId and metadata.email', () => {
   const sess = { email: 'a@x.com', display_name: 'Alice' }

@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { normalizeTools, buildToolPreamble, createToolCallParser, slimSchema, createSourcesStripper } from '../lib/tools.mjs'
-import { byteLen } from '../lib/translate.mjs'
+import { normalizeTools, buildToolPreamble, createToolCallParser, slimSchema, createSourcesStripper } from '../src/tools.ts'
+import { byteLen } from '../src/translate.ts'
 
 test('normalizeTools keeps only named function tools', () => {
   const tools = normalizeTools([

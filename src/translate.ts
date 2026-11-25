@@ -70,8 +70,8 @@ const decodedSize = (data) => {
  * still lands in `skipped`. Names are numbered across inline + upload.
  */
 export function pickImages(messages, maxBytes, { upload = false } = {}) {
-  const attachments = []
-  const toUpload = []
+  const attachments: any[] = []
+  const toUpload: any[] = []
   let bytes = 0
   let skipped = 0
   let seq = 0
@@ -127,7 +127,7 @@ export const MODELS = Object.freeze(
 /** Map a requested model id to an agent_mode; unknown → 'smart'. */
 export function modeFor(model) {
   const m = String(model ?? '').trim().toLowerCase()
-  const bare = m.includes('/') ? m.split('/').pop() : m
+  const bare = m.includes('/') ? (m.split('/').pop() ?? '') : m
   return AGENT_MODES.includes(bare) ? bare : 'smart'
 }
 
@@ -215,7 +215,7 @@ export const escapedBytes = text => byteLen(JSON.stringify(text)) - 2
 // On local outpost, Smart retrieved labels from custom_prompt at both 124 B
 // and 40 KiB, and missed both labels in system_prompt at either size. Keep
 // the persona override small; the caller's instructions appear exactly once.
-export function setInstructions(payload, system, custom, threadId) {
+export function setInstructions(payload, system, custom, threadId?: string) {
   if (!system) {
     if (custom) payload.custom_prompt = custom
     return false
@@ -337,7 +337,7 @@ function toolBlock(m, cap, cut) {
 }
 
 /** One transcript line for a non-tool message in the rendered history. */
-function transcriptLine(m, cut = () => {}, reminderCap = REMINDER_CAP) {
+function transcriptLine(m, cut: (why?: string) => void = () => {}, reminderCap = REMINDER_CAP) {
   const text = squeezeReminders(textOf(m.content), cut, reminderCap)
   const role = canonRole(m.role)
   if (role === 'assistant') {
@@ -348,6 +348,20 @@ function transcriptLine(m, cut = () => {}, reminderCap = REMINDER_CAP) {
 }
 
 const HISTORY_HEAD_RESERVE = 96
+
+/** What a render had to cut — shared by handler (turn note) and tests. */
+export interface RenderStats {
+  truncated?: boolean
+  dropped?: number
+  cut?: Record<string, number>
+  [key: string]: any
+}
+
+export interface RenderOptions {
+  maxBytes?: number
+  stats?: RenderStats
+  lossless?: boolean
+}
 
 /**
  * Byte cap for the current user turn: at least USER_TURN_CAP, up to 60% of
@@ -371,14 +385,14 @@ function lastTurnCap(budget) {
  * `lossless` renders everything uncut (no per-block caps, no reminder
  * squeeze, no budget) — the text to upload when a frame cannot hold it.
  */
-export function renderTranscript(messages, systemText, { maxBytes = Infinity, stats, lossless = false } = {}) {
+export function renderTranscript(messages: any[], systemText: string, { maxBytes = Infinity, stats, lossless = false }: RenderOptions = {}) {
   const cut = (why) => {
     if (!stats) return
     stats.truncated = true
     if (why) { stats.cut ||= {}; stats.cut[why] = (stats.cut[why] || 0) + 1 }
   }
   const cap = lossless ? Infinity : undefined
-  const parts = []
+  const parts: string[] = []
   if (systemText) {
     if (!lossless && byteLen(systemText) > SYSTEM_CAP) { systemText = capText(systemText, SYSTEM_CAP); cut('system') }
     parts.push(`[system instructions]\n${systemText}`)
@@ -434,14 +448,14 @@ export function renderTranscript(messages, systemText, { maxBytes = Infinity, st
  * results share the remaining budget (fitBlocks) — the current turn's
  * question is never sacrificed for tool output.
  */
-export function renderDelta(delta, { maxBytes = Infinity, stats } = {}) {
+export function renderDelta(delta: any[], { maxBytes = Infinity, stats }: RenderOptions = {}) {
   const cut = (why) => {
     if (!stats) return
     stats.truncated = true
     if (why) { stats.cut ||= {}; stats.cut[why] = (stats.cut[why] || 0) + 1 }
   }
   const toolCap = Number.isFinite(maxBytes) ? Math.max(TOOL_RESULT_CAP, maxBytes - 2048) : TOOL_RESULT_CAP
-  const blocks = []
+  const blocks: any[] = []
   for (const m of delta) {
     if (isTool(m)) { blocks.push(toolBlock(m, toolCap, cut)); continue }
     // assistant messages never appear in a valid delta (findContinuation rejects them)

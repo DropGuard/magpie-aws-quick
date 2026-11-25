@@ -3,11 +3,9 @@
   "version": "0.1.11",
   "description": "magpie / OpenCode provider plugin: use your own Amazon Quick (AWS Quick) account as a provider",
   "type": "module",
-  "main": "./index.mjs",
+  "main": "./src/index.ts",
   "files": [
-    "index.mjs",
-    "lib",
-    "bin",
+    "src",
     "README.md",
     "README.zh-CN.md",
     "PROTOCOL.md",
@@ -15,7 +13,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.strict.json"
   },
   "keywords": [
     "opencode",
@@ -45,5 +44,9 @@
       "en": "Your own Amazon Quick account as a provider.",
       "zh": "用你自己的 Amazon Quick 账号作为模型提供方。"
     }
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.10",
+    "typescript": "5.7"
   }
 }

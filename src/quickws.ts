@@ -82,7 +82,9 @@ function wrapEvent(innerJson) {
 }
 
 export class QuickWsError extends Error {
-  constructor(message, { code, kind } = {}) {
+  code: any
+  kind: any
+  constructor(message: string, { code, kind, status }: { code?: any; kind?: string; status?: any } = {}) {
     super(message)
     this.name = 'QuickWsError'
     this.code = code
@@ -112,6 +114,21 @@ const TURN_ACTIVITY = new Set(['message_start', 'text_delta', 'thinking_delta', 
  * Events are dispatched to per-thread waiters registered via turn().
  */
 export class QuickSocket {
+  connecting: Promise<void> | null
+  closed: boolean
+  _connectFail: any
+  _pingTimer: any
+  _sessionAck: any
+  buf: any
+  extra: any
+  getSession: any
+  lastActivity: any
+  log: any
+  outpostId: any
+  settledAt: any
+  settling: any
+  waiters: any
+  ws: any
   /**
    * @param {object} opts
    * @param {Function} opts.getSession async () => sncs-session object (fresh token)
@@ -165,7 +182,7 @@ export class QuickSocket {
     this.ws = ws
     this.buf = new Uint8Array(0)
 
-    await new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new QuickWsError('WebSocket 连接超时', { kind: 'timeout' })), CONNECT_TIMEOUT_MS)
       ws.onopen = () => { clearTimeout(timer); resolve() }
       ws.onerror = (e) => { clearTimeout(timer); reject(new QuickWsError('WebSocket 连接失败', { kind: 'ws' })) }
@@ -184,8 +201,8 @@ export class QuickSocket {
     // otherwise it lands with no waiters registered, gets dropped, and the
     // first turn hangs on a session that was never established.
     try {
-      await new Promise((resolve, reject) => {
-        const done = (fn, v) => { clearTimeout(t); this._sessionAck = null; this._connectFail = null; fn(v) }
+      await new Promise<void>((resolve, reject) => {
+        const done = (fn: (v?: any) => void, v?: any) => { clearTimeout(t); this._sessionAck = null; this._connectFail = null; fn(v) }
         const t = setTimeout(() => done(resolve), 8000)
         t.unref?.()
         this._sessionAck = () => done(resolve)
@@ -323,7 +340,7 @@ export class QuickSocket {
    * @param {object} payload user_message payload fields (text, agent_mode, …)
    * @param {object} [opts] {signal, onEvent}
    */
-  async *turn(threadId, payload, { signal, onEvent } = {}) {
+  async *turn(threadId: string, payload: any, { signal, onEvent }: { signal?: AbortSignal; onEvent?: (e: any) => void } = {}) {
     await this.connect()
     // A stop() on this thread may still be flushing the stopped turn's tail;
     // wait for its terminal event (or the timeout) before queueing a new

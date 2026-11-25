@@ -11,20 +11,23 @@
 // the instruction is inline and strong (verified live). lib/tools.mjs owns the
 // preamble + streaming parser; results return as role:'tool' messages rendered
 // into the next turn's text.
-import { QuickSocket, QuickWsError } from './quickws.mjs'
-import { OutpostError } from './outpost.mjs'
-import { uploadImage, uploadFile } from './attach.mjs'
-import { isPermissionReview, prepareReview, materializeReview, readReview } from './review.mjs'
-import { normalizeTools, buildToolPreamble, createToolCallParser, createSourcesStripper } from './tools.mjs'
-import { profileUsage } from './usage.mjs'
+import { QuickSocket, QuickWsError } from './quickws.ts'
+import { OutpostError } from './outpost.ts'
+import { uploadImage, uploadFile } from './attach.ts'
+import { isPermissionReview, prepareReview, materializeReview, readReview } from './review.ts'
+import { normalizeTools, buildToolPreamble, createToolCallParser, createSourcesStripper } from './tools.ts'
+import { profileUsage } from './usage.ts'
+import { frameRoom, pickPreamble } from './protocol/frame.ts'
+import { nextRetry } from './runtime/retry.ts'
 import {
   AGENT_MODES, MODELS, modeFor, effortFor, renderTranscript, renderDelta, renderToolCalls, textOf,
   byteLen, capText, capMiddle, escapedBytes, setInstructions, UPSTREAM_TEXT_LIMIT, canonRole, pickImages,
-} from './translate.mjs'
+} from './translate.ts'
+import type { RenderStats } from './translate.ts'
 import {
   chainHashes, sessionScope, findContinuation, extendHash, replyMessage,
   replyAnchor, tailAnchor,
-} from './sessions.mjs'
+} from './sessions.ts'
 
 const SURFACE = 'QUICK_WORK_DESKTOP_WINDOWS'
 const APP_VERSION = '1.2.4660'
@@ -348,12 +351,7 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
     if (clientToolExact.has(name)) return name
     return clientToolLower.get(name.toLowerCase()) ?? null
   }
-  // The frame is JSON, so instructions cost their escaped size (a newline in
-  // the system prompt is two bytes), not their raw length. Reserving the raw
-  // size left the frame a few hundred bytes short and clipped the caller's
-  // rules — the worst thing to lose — while the tool spec stayed verbose.
-  const systemReserve = Math.min(systemText ? escapedBytes(systemText) : 0, SYSTEM_PROMPT_RESERVE)
-  const stats = {}
+  const stats: RenderStats = {}
   // Every truncation records its reason ('preamble'/'frame' here, the rest in
   // translate.mjs) so the note can say what actually happened.
   const mark = (why) => {
@@ -367,7 +365,7 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
     if (!from) return
     if (from.truncated) stats.truncated = true
     if (from.dropped) stats.dropped = (stats.dropped || 0) + from.dropped
-    for (const [why, n] of Object.entries(from.cut || {})) {
+    for (const [why, n] of Object.entries((from.cut || {}) as Record<string, number>)) {
       stats.cut ||= {}
       stats.cut[why] = (stats.cut[why] || 0) + n
     }
@@ -395,11 +393,8 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
   // artifacts). External clients render plain text/Markdown, so that markup
   // leaks as raw tags. Scoped so code/file output (e.g. HTML <option>) is unaffected.
   const customPrompt = [baseCustomPrompt, tools.length ? TOOLS_STILL_APPLY : '', PLAIN_TEXT_NOTE].filter(Boolean).join(' ')
-  const promptReserve = escapedBytes(customPrompt)
-  // 1536 covers the envelope (thread id, base fields, keys); the transcript is
-  // escaped too, so keep ~3% headroom on top.
-  const frameRoom = UPSTREAM_TEXT_LIMIT - systemReserve - promptReserve - 1536
-  const textCap = Math.max(8 * 1024, Math.floor(frameRoom / 1.03))
+  // protocol/frame.ts owns every byte of this arithmetic.
+  const textCap = frameRoom({ systemText, customPrompt })
 
   // Thread identity: account, agent mode and the caller's system text (which
   // separates main agent, subagents and the permission reviewer). Thinking
@@ -474,43 +469,17 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
     }
   }
   const reuse = cont ?? fuzzy ?? sessHit
-  // A tool preamble that would leave under ~8 KB for the actual message
-  // degrades to names+descriptions first — otherwise the frame hard-cap
-  // (a tail cut) would eat the user's question and the model would see
-  // only the tool list. Names-only is the last resort: verbose descriptions
-  // can keep even the lite preamble over budget, and a shed preamble means
-  // zero tool instructions and guaranteed plain-text answers.
-  // The tool spec is the disposable part of the frame: the caller's current
-  // message (which carries AGENTS.md and the memory index inside its
-  // <system-reminder>) must arrive whole, so the spec degrades first.
-  // Compress just enough, and in the right order: a tool's prose description is
-  // 4x the size of its structural schema for Claude Code's toolset, and the
-  // schema is what keeps arguments correct. So shorten descriptions first,
-  // keep the schemas, and only then drop schemas (lite) or everything but
-  // names. Jumping straight to lite freed 23 KB to cover a 1.6 KB shortfall.
+  // The tool spec is the disposable part of the frame: the caller's message
+  // (with AGENTS.md and the memory index inside its <system-reminder>) must
+  // arrive whole, so the spec compresses first — descriptions before schemas,
+  // and only as far as the room requires. protocol/frame.ts owns the ladder.
   const fitPreamble = (list = tools, need = 0) => {
-    const room = textCap - need - 512
-    const tiers = [
-      ['full', {}],
-      ['desc1200', { descCap: 1200 }],
-      ['desc600', { descCap: 600 }],
-      ['desc300', { descCap: 300 }],
-      ['desc120', { descCap: 120 }],
-      ['lite', { lite: true }],
-      ['names', { namesOnly: true }],
-    ]
-    let best = null
-    for (const [tier, opts] of tiers) {
-      const pre = buildToolPreamble(list, body.tool_choice, opts)
-      if (!best || byteLen(pre) < byteLen(best.pre)) best = { tier, pre }
-      if (byteLen(pre) <= room) {
-        if (tier !== 'full') { mark('preamble'); stats.specTier = tier }
-        return pre
-      }
+    const picked = pickPreamble({ tools: list, toolChoice: body.tool_choice, room: textCap, need })
+    if (picked.concession) {
+      mark('preamble')
+      stats.specTier = picked.tier
     }
-    mark('preamble')
-    stats.specTier = best.tier
-    return best.pre
+    return picked.preamble
   }
   // A reused thread already holds the spec of every tool described in it
   // (entry.toolNames), and whatever rides in `text` stays in Quick's
@@ -643,7 +612,7 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
     text = prefix + renderDelta(reuse.delta, { maxBytes: turnBudget - byteLen(prefix), stats }) + imageNote
     reused = true
   } else {
-    const tstats = {}
+    const tstats: RenderStats = {}
     text = renderTranscript(convo, '', { maxBytes: turnBudget, stats: tstats }) + imageNote
     mergeStats(tstats)
     // History that had to be dropped from the frame is not thrown away: it
@@ -971,7 +940,8 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
   } catch (e) {
     const term = turnTermination(e, threadId)
     if (term) throw term
-    if (e?.kind === 'guardrail' && !produced() && guardTries < guardMax) {
+    const action = nextRetry({ guardTries, guardMax, reused: !!(reuse && sessions), produced: produced() }, e)
+    if (action.type === 'guardrail-retry') {
       guardTries++
       resetParser()
       payload.text = GUARDRAIL_RETRY_NUDGE
@@ -983,7 +953,7 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
       yield { type: 'note', text: retryNote }
       continue
     }
-    if (!(reuse && sessions) || produced() || e?.kind === 'auth' || e?.kind === 'timeout') throw e
+    if (action.type === 'stop') throw e
     // Cached thread may be gone server-side: retry once on a fresh thread with
     // the full transcript (same policy as magpie-comate). Uploaded files live
     // in the dead thread's workspace, so they are delivered again for `fresh`.
@@ -992,7 +962,7 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
     toolNames = tools.map((t) => t.name)
     const up2 = await uploadAll(fresh)
     const retryAttachments = images.attachments.concat(up2.entries)
-    const rstats = {}
+    const rstats: RenderStats = {}
     let full = renderTranscript(convo, '', { maxBytes: turnBudget, stats: rstats }) + imageNoteFor(up2.failed)
     mergeStats(rstats)
     let retryNote = rstats.dropped ? '' : cutNote(rstats, false)
@@ -1100,7 +1070,7 @@ export async function handleChatCompletions({ body, outpostMgr, sessions, option
   const systemText = messages.filter(m => m.role === 'system' || m.role === 'developer').map(m => textOf(m.content)).join('\n\n')
   const mode = modeFor(model)
   const effort = effortFor(effortHeader, body)
-  const base = {
+  const base: any = {
     message_id: crypto.randomUUID(), agent_mode: mode,
     user_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
     user_locale: (Intl.DateTimeFormat().resolvedOptions().locale || 'en-US').replace('_', '-'),
@@ -1233,7 +1203,7 @@ export async function handleChatCompletions({ body, outpostMgr, sessions, option
     noteQuota(e)
       return errorResponse(httpStatus(e), e?.message ?? String(e), errorType(e))
     }
-    const message = { role: 'assistant', content: text }
+    const message: any = { role: 'assistant', content: text }
     if (reasoning) message.reasoning_content = reasoning
     if (calls.length) message.tool_calls = calls
     return new Response(

@@ -16,7 +16,7 @@
 import { createHash } from 'node:crypto'
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { textOf, canonRole } from './translate.mjs'
+import { textOf, canonRole } from './translate.ts'
 
 // 24h idle TTL: real agent sessions pause far longer than 30min between turns.
 // A stale threadId is safe — the handler retries once on a fresh thread.
@@ -41,7 +41,7 @@ export function canonMessage(m) {
 
 /** Assistant message as we answered it (text + any tool calls we emitted). */
 export function replyMessage(text, toolCalls) {
-  const m = { role: 'assistant', content: text ?? '' }
+  const m: any = { role: 'assistant', content: text ?? '' }
   if (toolCalls?.length) {
     m.tool_calls = toolCalls.map((c) => ({
       id: c.id,
@@ -84,12 +84,18 @@ export const tailAnchor = (scope, msgs) => sha(`${scope}|tail|${(msgs ?? []).map
  *   hosts may re-instantiate per request/session, which would otherwise drop
  *   every cached thread. Only hashes, threadIds, tool names and call ids are stored, never content.
  */
-export function createSessionStore({ ttlMs = SESSION_DEFAULTS.ttlMs, max = SESSION_DEFAULTS.max, now = () => Date.now(), file = null } = {}) {
+export function createSessionStore({ ttlMs = SESSION_DEFAULTS.ttlMs, max = SESSION_DEFAULTS.max, now = () => Date.now(), file = null }: {
+  ttlMs?: number
+  max?: number
+  now?: () => number
+  file?: string | null
+} = {}) {
   const map = new Map() // key → {entry, at}; insertion order = LRU order
   if (file) {
     try {
       const db = JSON.parse(readFileSync(file, 'utf8'))
-      for (const [k, v] of Object.entries(db?.entries ?? {})) {
+      const saved = (db?.entries ?? {}) as Record<string, any>
+      for (const [k, v] of Object.entries(saved)) {
         if (v && typeof v.threadId === 'string' && Number.isFinite(v.at) && now() - v.at <= ttlMs) {
           const toolNames = Array.isArray(v.toolNames) ? v.toolNames.filter((n) => typeof n === 'string') : undefined
           map.set(k, { entry: { threadId: v.threadId, replyKey: v.replyKey, tailKey: v.tailKey, toolNames, callIds: Array.isArray(v.callIds) ? v.callIds : undefined }, at: v.at })

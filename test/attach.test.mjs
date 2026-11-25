@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
-import { uploadImage, uploadFile } from '../lib/attach.mjs'
+import { uploadImage, uploadFile } from '../src/attach.ts'
 
 const PNG_B64 = Buffer.from('fake-png-bytes-12345').toString('base64')
 const RAW = Buffer.from(PNG_B64, 'base64')

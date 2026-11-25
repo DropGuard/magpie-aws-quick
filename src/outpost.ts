@@ -17,7 +17,9 @@ import os from 'node:os'
 import path from 'node:path'
 
 export class OutpostError extends Error {
-  constructor(message, { status, kind } = {}) {
+  kind: any
+  status: any
+  constructor(message: string, { status, kind }: { status?: any; kind?: string } = {}) {
     super(message)
     this.name = 'OutpostError'
     this.status = status
@@ -27,12 +29,27 @@ export class OutpostError extends Error {
 
 const EXE_NAME = process.platform === 'win32' ? 'quickwork-agent.exe' : 'quickwork-agent'
 
+/** Plugin options the outpost reads (unknown extras are tolerated). */
+export interface OutpostOptions {
+  agentPath?: string
+  agentZip?: string
+  userDataDir?: string
+  cacheDir?: string
+  port?: number
+  buildStage?: string
+  profileStage?: string
+  env?: Record<string, string>
+  instanceToken?: string
+  log?: (msg: string) => void
+  [key: string]: any
+}
+
 function envPaths(...parts) {
   return parts.filter(Boolean).map((p) => path.join(...p))
 }
 
 /** Candidate directories that may already contain an extracted agent/. */
-function extractedAgentDirs(options = {}) {
+function extractedAgentDirs(options: OutpostOptions = {}) {
   const dirs = []
   if (options.userDataDir) dirs.push(path.join(options.userDataDir, 'agent'))
   const home = os.homedir()
@@ -59,7 +76,7 @@ function extractedAgentDirs(options = {}) {
 }
 
 /** Candidate agent.zip files shipped inside the installed app. */
-function agentZipCandidates(options = {}) {
+function agentZipCandidates(options: OutpostOptions = {}) {
   const zips = []
   if (options.agentZip) zips.push(options.agentZip)
   if (process.platform === 'win32') {
@@ -120,7 +137,7 @@ export function extractZip(zipPath, destDir) {
  * Locate quickwork-agent. Returns { path, source } or throws OutpostError.
  * Order: explicit option → app's extracted copy → in-bundle binary → extract agent.zip.
  */
-export function findAgent(options = {}) {
+export function findAgent(options: OutpostOptions = {}) {
   if (options.agentPath && existsSync(options.agentPath)) {
     return { path: options.agentPath, source: 'option' }
   }
@@ -158,7 +175,7 @@ function freePort() {
     const s = createServer()
     s.once('error', reject)
     s.listen(0, '127.0.0.1', () => {
-      const { port } = s.address()
+      const { port } = s.address() as import('node:net').AddressInfo
       s.close(() => resolve(port))
     })
   })
@@ -167,6 +184,15 @@ function freePort() {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 export class Outpost {
+  base: any
+  child: any
+  dead: any
+  log: any
+  options: any
+  port: any
+  sessionCache: any
+  starting: any
+  token: any
   /**
    * @param {object} options plugin options
    * @param {string} [options.agentPath] explicit quickwork-agent path
@@ -179,7 +205,7 @@ export class Outpost {
    * @param {object} [options.env] extra env for the child
    * @param {Function} [options.log]
    */
-  constructor(options = {}) {
+  constructor(options: OutpostOptions = {}) {
     this.options = options
     this.log = options.log ?? (() => {})
     this.token = options.instanceToken || `magpie-${process.pid}-${Math.random().toString(36).slice(2)}`
@@ -267,7 +293,7 @@ export class Outpost {
     throw new OutpostError(`outpost 启动超时: ${lastErr?.message ?? 'no response'}`, { kind: 'timeout' })
   }
 
-  async _fetch(pathname, { method = 'GET', body, timeoutMs = 20_000 } = {}) {
+  async _fetch(pathname: string, { method = 'GET', body, timeoutMs = 20_000 }: { method?: string; body?: any; timeoutMs?: number } = {}) {
     const ctrl = new AbortController()
     const t = setTimeout(() => ctrl.abort(), timeoutMs)
     try {

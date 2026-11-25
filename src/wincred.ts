@@ -155,8 +155,8 @@ Write-Output 'ok'
 
 const encode = (script) => Buffer.from(script, 'utf16le').toString('base64')
 
-function runPs(args, { timeoutMs = 20000 } = {}) {
-  return new Promise((resolve, reject) => {
+function runPs(args, { timeoutMs = 20000 } = {}): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
     execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', ...args],
       { timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
       (err, stdout, stderr) => {

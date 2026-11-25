@@ -42,7 +42,7 @@ function nextMonthStart(now = new Date()) {
  * Map a getAvailableEntitlementUnits response to magpie's usage shape. Units
  * drawing on the same pool (identical minutes) collapse into one window.
  */
-export function usageFromEntitlements(resp, { user, now } = {}) {
+export function usageFromEntitlements(resp, { user, now }: { user?: any; now?: Date } = {}) {
   const windows = []
   const seen = new Map()
   for (const e of Array.isArray(resp?.entitlements) ? resp.entitlements : []) {
@@ -91,12 +91,12 @@ function userOf(sess) {
  * auth.usage for one account. `getSession` resolves the account's live Quick
  * session ({id_token, tenant_url, aws_account_id, actor_arn}).
  */
-export async function quickUsage(getSession, { fetchImpl, signal } = {}) {
+export async function quickUsage(getSession, { fetchImpl, signal }: { fetchImpl?: typeof fetch; signal?: AbortSignal } = {}) {
   try {
     const sess = await getSession()
     const tenant = String(sess?.tenant_url || '').replace(/\/+$/, '')
     if (!tenant || !sess?.id_token) return { error: 'Amazon Quick 会话不可用，无法查询用量' }
-    const f = fetchImpl ?? ((...a) => globalThis.fetch(...a))
+    const f = fetchImpl ?? ((...a: Parameters<typeof fetch>) => globalThis.fetch(...a))
     const type = 'getAvailableEntitlementUnits'
     const r = await f(`${tenant}/integration/quick-work/qbs-event`, {
       method: 'POST',
@@ -169,13 +169,13 @@ function unwrapInvokeAgent(j) {
  * session ({id_token|jwt, tenant_url}). Returns usageFromProfile's shape or
  * {error, signIn?} — never throws, never leaks tokens.
  */
-export async function profileUsage(getSession, { fetchImpl, signal } = {}) {
+export async function profileUsage(getSession, { fetchImpl, signal }: { fetchImpl?: typeof fetch; signal?: AbortSignal } = {}) {
   try {
     const sess = await getSession()
     const tenant = String(sess?.tenant_url || '').replace(/\/+$/, '')
     const bearer = sess?.id_token || sess?.jwt || sess?.tokens?.access_token
     if (!tenant || !bearer) return { error: 'Amazon Quick 会话不可用，无法查询用量' }
-    const f = fetchImpl ?? ((...a) => globalThis.fetch(...a))
+    const f = fetchImpl ?? ((...a: Parameters<typeof fetch>) => globalThis.fetch(...a))
     const r = await f(`${tenant}/integration/quick-work/qbs-event`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bearer}`, 'x-amzn-qs-internal-trace-id': crypto.randomUUID() },

@@ -7,7 +7,7 @@ import {
   createSessionStore, runOAuthLogin, startOAuthLogin, refreshSession, buildSession,
   keyForSession, createDirectBackend, OAuthError, rememberDiscovery, takeDiscovery,
   oauthDeviceId, isDeviceId,
-} from '../lib/oauth.mjs'
+} from '../src/oauth.ts'
 
 const tmp = () => mkdtempSync(path.join(tmpdir(), 'oauth-test-'))
 

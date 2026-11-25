@@ -1,8 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
-import { startFakeQuick, defaultScript } from './helpers/fake-quick.mjs'
-import { QuickSocket } from '../lib/quickws.mjs'
+import { startFakeQuick, defaultScript } from './helpers/fake-quick.ts'
+import { QuickSocket } from '../src/quickws.ts'
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 

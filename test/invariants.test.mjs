@@ -13,8 +13,8 @@
 // where the model reports "my rules were truncated".
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { startFakeQuick } from './helpers/fake-quick.mjs'
-import { handleChatCompletions, cutNote } from '../lib/handler.mjs'
+import { startFakeQuick } from './helpers/fake-quick.ts'
+import { handleChatCompletions, cutNote } from '../src/handler.ts'
 
 let fake
 before(async () => { fake = await startFakeQuick({}) })

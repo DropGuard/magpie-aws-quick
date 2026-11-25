@@ -1,8 +1,8 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { startFakeQuick, defaultScript } from './helpers/fake-quick.mjs'
-import { handleChatCompletions } from '../lib/handler.mjs'
-import { isPseudo200UsageLimitText, isPseudo200UsageLimitPrefix, resetQuotaWindows, quotaCooldownLeft } from '../lib/handler.mjs'
+import { startFakeQuick, defaultScript } from './helpers/fake-quick.ts'
+import { handleChatCompletions } from '../src/handler.ts'
+import { isPseudo200UsageLimitText, isPseudo200UsageLimitPrefix, resetQuotaWindows, quotaCooldownLeft } from '../src/handler.ts'
 
 const QUOTA_SENTENCE = "You've reached your usage limit. Check your profile for details."
 
@@ -157,7 +157,7 @@ test('after a quota failure the account fails fast (429) without touching upstre
 })
 
 test('exhaustionMinutes prefers session resume_in_minutes, then monthly reset', async () => {
-  const { exhaustionMinutes } = await import('../lib/handler.mjs')
+  const { exhaustionMinutes } = await import('../src/handler.ts')
   assert.equal(exhaustionMinutes({ session: { exhausted: true, resumeInMinutes: 42 }, monthly: { exhausted: false } }), 42)
   assert.equal(exhaustionMinutes({ session: { exhausted: true, resumeInMinutes: 0 } }), 30)
   const monthlyOnly = exhaustionMinutes({ session: { exhausted: false }, monthly: { exhausted: true, resetsAt: new Date(Date.now() + 3600_000).toISOString() } })

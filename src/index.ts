@@ -48,16 +48,16 @@
  */
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { createOutpostManager } from './lib/outpost.mjs'
-import { handleChatCompletions, handleModels } from './lib/handler.mjs'
-import { createSessionStore, SESSION_DEFAULTS } from './lib/sessions.mjs'
-import { MODELS } from './lib/translate.mjs'
+import { createOutpostManager } from './outpost.ts'
+import { handleChatCompletions, handleModels } from './handler.ts'
+import { createSessionStore, SESSION_DEFAULTS } from './sessions.ts'
+import { MODELS } from './translate.ts'
 import {
   createSessionStore as createOAuthStore, createDirectBackend,
   startOAuthLogin, takeDiscovery, keyForSession, accountIdentity, OAuthError, defaultStoreDir, oauthDeviceId, isDeviceId,
-} from './lib/oauth.mjs'
-import { createCredManBackend, loadCredManSession, credManDeviceId } from './lib/credman.mjs'
-import { quickUsage } from './lib/usage.mjs'
+} from './oauth.ts'
+import { createCredManBackend, loadCredManSession, credManDeviceId } from './credman.ts'
+import { quickUsage } from './usage.ts'
 
 const PROVIDER = 'aws-quick'
 // Requests never reach this address: the loader's fetch intercepts them.
@@ -237,12 +237,12 @@ export const AwsQuickAuthPlugin = async (_input, options) => {
   // on the server for the browser flow, then stores the session + refresh
   // token in a private config file. No desktop app, no outpost at request
   // time.
-  function oauthSignIn({ label, labels, instructions, opened }) {
+  function oauthSignIn({ label, labels, instructions, opened }: { label: any; labels: any; instructions: any; opened?: boolean }) {
     return {
       type: 'oauth',
       label,
       labels,
-      authorize: async (_inputs, { signal } = {}) => {
+      authorize: async (_inputs, { signal }: { signal?: AbortSignal } = {}) => {
         let started
         try {
           started = await startOAuthLogin(startOAuthOpts(signal))
@@ -255,7 +255,7 @@ export const AwsQuickAuthPlugin = async (_input, options) => {
           method: 'auto',
           instructions,
           ...(opened ? { opened: true } : {}),
-          callback: async (_code, { signal: s } = {}) => {
+          callback: async (_code, { signal: s }: { signal?: AbortSignal } = {}) => {
             const unwire = wireAbort(s, cancel)
             try {
               const sess = await done
@@ -282,7 +282,7 @@ export const AwsQuickAuthPlugin = async (_input, options) => {
       type: 'oauth',
       label: '复制登录地址（不自动打开浏览器）',
       labels: { zh: '复制登录地址（不自动打开浏览器）', 'zh-TW': '複製登錄地址（不自動打開瀏覽器）', en: "Copy sign-in link (don't open a browser)" },
-      authorize: async (_inputs, { signal } = {}) => {
+      authorize: async (_inputs, { signal }: { signal?: AbortSignal } = {}) => {
         const dir = opts.sessionDir ?? defaultStoreDir()
         const discovery = takeDiscovery(dir)
         let started
@@ -299,7 +299,7 @@ export const AwsQuickAuthPlugin = async (_input, options) => {
           instructions: discovery
             ? '已记住上次的账号信息。复制下方链接到浏览器里登录，完成后把地址栏里的完整地址粘贴到下面。'
             : '复制下方链接，到你要用的浏览器里打开并登录。登录完把浏览器地址栏里的完整地址粘贴到下面（页面打不开也没关系，复制地址就行）。',
-          callback: async (code, { signal: s } = {}) => {
+          callback: async (code, { signal: s }: { signal?: AbortSignal } = {}) => {
             const unwire = wireAbort(s, cancel)
             try {
               const sess = await submit(code)
@@ -357,7 +357,7 @@ export const AwsQuickAuthPlugin = async (_input, options) => {
           keyless: true,
           label: '本地凭据（Amazon Quick 桌面端登录态）',
           labels: { zh: '本地凭据（Amazon Quick 桌面端登录态）', 'zh-TW': '本機憑據（Amazon Quick 桌面端登錄態）' },
-          authorize: async (_inputs, { signal } = {}) => {
+          authorize: async (_inputs, { signal }: { signal?: AbortSignal } = {}) => {
             if (process.platform === 'win32') {
               try {
                 const sess = await loadCredManSession()
@@ -408,7 +408,7 @@ export const AwsQuickAuthPlugin = async (_input, options) => {
 
     provider: {
       id: PROVIDER,
-      async models(provider, { auth } = {}) {
+      async models(provider, { auth }: { auth?: any } = {}) {
         if (auth?.type !== 'api' || !auth.key) return provider.models
         const out = {}
         for (const m of MODELS) out[m.id] = structuredClone(BASE_MODEL)

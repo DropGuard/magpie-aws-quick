@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { quickUsage, usageFromEntitlements, planName } from '../lib/usage.mjs'
+import { quickUsage, usageFromEntitlements, planName } from '../src/usage.ts'
 
 const RESP = {
   entitlements: [

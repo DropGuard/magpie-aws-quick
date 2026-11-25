@@ -12,8 +12,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { readQuickCredentials, writeQuickCredential } from './wincred.mjs'
-import { createDirectBackend, defaultStoreDir, isDeviceId } from './oauth.mjs'
+import { readQuickCredentials, writeQuickCredential } from './wincred.ts'
+import { createDirectBackend, defaultStoreDir, isDeviceId } from './oauth.ts'
 
 const REGION_RE = /(us|eu|ap|sa|ca|me|af|il)-(east|west|north|south|central|northeast|southeast|southwest|northwest)-\d/
 
@@ -123,7 +123,7 @@ export function profileDeviceId(target, { home = os.homedir() } = {}) {
  * own device_id when it can be found, else an id generated once per
  * credential target and kept in the plugin's own store dir.
  */
-export function credManDeviceId({ dir = defaultStoreDir(), home } = {}) {
+export function credManDeviceId({ dir = defaultStoreDir(), home }: { dir?: string; home?: string } = {}) {
   const file = path.join(dir, 'credman-devices.json')
   return (s) => {
     const target = s?._credTarget || ''
@@ -142,7 +142,11 @@ export function credManDeviceId({ dir = defaultStoreDir(), home } = {}) {
 }
 
 /** Outpost-shaped backend backed by Credential Manager (+OIDC refresh). */
-export function createCredManBackend({ fetchImpl = fetch, log = () => {}, deviceId } = {}) {
+export function createCredManBackend({ fetchImpl = fetch, log = () => {}, deviceId }: {
+  fetchImpl?: typeof fetch
+  log?: (msg: string) => void
+  deviceId?: (s: any) => any
+} = {}) {
   return createDirectBackend({
     load: () => loadCredManSession(),
     persist: (s) => persistCredManSession(s),

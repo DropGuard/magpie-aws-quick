@@ -1,0 +1,17 @@
+{
+  // Strict gate for the modules that own budgeting and retry policy.
+  // Both are dependency-light and already strict-clean; the wider tree is
+  // kept on the loose project so the incremental port stays reviewable.
+  // noImplicitAny stays off: the old translate/tools helpers (pulled in as
+  // imports) carry any-typed data shapes on purpose.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "strict": true,
+    "noImplicitAny": false
+  },
+  "include": [
+    "src/globals.d.ts",
+    "src/protocol/**/*.ts",
+    "src/runtime/**/*.ts"
+  ]
+}

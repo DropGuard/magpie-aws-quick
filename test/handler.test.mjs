@@ -1,10 +1,10 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { startFakeQuick, defaultScript } from './helpers/fake-quick.mjs'
-import { PLAIN_TEXT_NOTE, TOOLS_STILL_APPLY, INVALID_CALL_TOOL, handleChatCompletions, handleModels } from '../lib/handler.mjs'
-import { createSessionStore } from '../lib/sessions.mjs'
-import { byteLen, frameBytes, UPSTREAM_TEXT_LIMIT } from '../lib/translate.mjs'
-import { OutpostError } from '../lib/outpost.mjs'
+import { startFakeQuick, defaultScript } from './helpers/fake-quick.ts'
+import { PLAIN_TEXT_NOTE, TOOLS_STILL_APPLY, INVALID_CALL_TOOL, handleChatCompletions, handleModels } from '../src/handler.ts'
+import { createSessionStore } from '../src/sessions.ts'
+import { byteLen, frameBytes, UPSTREAM_TEXT_LIMIT } from '../src/translate.ts'
+import { OutpostError } from '../src/outpost.ts'
 
 let fake
 let outpostMgr

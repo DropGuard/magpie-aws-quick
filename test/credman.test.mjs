@@ -3,8 +3,8 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { sessionFromBlob, mergeForCredWrite, regionFromTenant, profileDeviceId, credManDeviceId } from '../lib/credman.mjs'
-import { createDirectBackend } from '../lib/oauth.mjs'
+import { sessionFromBlob, mergeForCredWrite, regionFromTenant, profileDeviceId, credManDeviceId } from '../src/credman.ts'
+import { createDirectBackend } from '../src/oauth.ts'
 
 const blob = {
   refresh_token: 'rt-1',
@@ -122,7 +122,7 @@ test('credman device id: the desktop profile\'s own device_id, else one stable g
 })
 
 test('parseCredentialsOutput handles PS5.1 value-wrapped multi-credential output', async () => {
-  const { parseCredentialsOutput } = await import('../lib/wincred.mjs')
+  const { parseCredentialsOutput } = await import('../src/wincred.ts')
   const entry = (target, rt) => ({ target, data: { refresh_token: rt, access_token: 'x' } })
   // bare array (PS7 / single item shapes)
   assert.equal(parseCredentialsOutput(JSON.stringify([entry('a', 'r1'), entry('b', 'r2')])).length, 2)

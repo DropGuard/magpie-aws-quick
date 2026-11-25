@@ -1,8 +1,8 @@
 // Claude Code's Auto permission reviewer asks for a decision about a quoted
 // transcript. Its system policy and its evidence must both reach Quick intact.
 import { createHash } from 'node:crypto'
-import { byteLen, capMiddle, frameBytes, setInstructions, textOf, UPSTREAM_TEXT_LIMIT } from './translate.mjs'
-import { QuickWsError } from './quickws.mjs'
+import { byteLen, capMiddle, frameBytes, setInstructions, textOf, UPSTREAM_TEXT_LIMIT } from './translate.ts'
+import { QuickWsError } from './quickws.ts'
 
 export const REVIEW_CONTEXT = 'Review the quoted transcript using the complete application system policy. Use no tools. Return only the exact machine-readable response specified by that policy.'
 
