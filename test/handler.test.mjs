@@ -1448,3 +1448,34 @@ test('contextAttachments:false uploads nothing and fails loudly instead of cutti
   const body = await res.json()
   assert.match(body.error.message, /context_length_exceeded/)
 })
+
+test('a squeezed <system-reminder> stays silent: it is duplicated in the system prompt', async () => {
+  // The old blanket "context over 64KB, earlier content cut" note fired on this
+  // alone and sent people hunting for a size problem that was not there.
+  const messages = [
+    { role: 'user', content: '<system-reminder>' + 'r'.repeat(16000) + '</system-reminder>' },
+    { role: 'assistant', content: 'noted' },
+    { role: 'user', content: 'continue with the plan' },
+  ]
+  const res = await req({ model: 'fast', stream: true, messages })
+  assert.equal(res.status, 200)
+  const events = await readSse(res)
+  const said = events.map((e) => String(e.choices?.[0]?.delta?.content ?? '')).join('')
+  assert.ok(!said.includes('单帧上限'), `no size warning for a reminder squeeze: ${said}`)
+  assert.ok(!said.includes('已截断'))
+})
+
+test('a shrunk tool result says so instead of blaming the context size', async () => {
+  const messages = [
+    { role: 'user', content: 'read the log' },
+    { role: 'assistant', content: '', tool_calls: [{ id: 'call_big', type: 'function', function: { name: 'Read', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'call_big', content: 'L'.repeat(40000) },
+  ]
+  const res = await req({ model: 'fast', stream: true, messages, tools: [fnTool('Read')] })
+  assert.equal(res.status, 200)
+  const events = await readSse(res)
+  const said = events.map((e) => String(e.choices?.[0]?.delta?.content ?? '')).join('')
+  assert.match(said, /工具结果过大/)
+  assert.match(said, /缩小范围重跑/)
+  assert.ok(!said.includes('已截断较早内容'))
+})
