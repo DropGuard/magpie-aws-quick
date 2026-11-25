@@ -115,7 +115,9 @@ test('renderTranscript keeps the opening user message, drops the middle, keeps f
 })
 
 test('renderTranscript caps oversized system prompt and user turn', () => {
-  const messages = [{ role: 'user', content: 'u'.repeat(30 * 1024) }]
+  // The turn itself must exceed what is left after the (capped) system prompt,
+  // otherwise it is kept whole: a message that fits is never cut.
+  const messages = [{ role: 'user', content: 'u'.repeat(40 * 1024) }]
   const stats = {}
   const out = renderTranscript(messages, 's'.repeat(40 * 1024), { maxBytes: UPSTREAM_TEXT_LIMIT, stats })
   assert.ok(stats.truncated)

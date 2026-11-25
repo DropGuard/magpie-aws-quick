@@ -141,3 +141,16 @@ test('invariant: every cut the client can see is named by cutNote', () => {
   // a squeezed reminder alone is duplicated context: no note
   assert.equal(cutNote({ cut: { reminder: 1 } }, false), '')
 })
+
+test('invariant: a subagent brief that fits the frame is never cut', async () => {
+  // Subagent first turns carry the whole task in one message (~21 KB here,
+  // with the instructions block inside it). The old 60%-of-budget pre-cap cut
+  // it while 40% of the frame sat unused, leaving a "middle truncated" marker
+  // inside the task description.
+  const brief = 'TASK-BRIEF ' + 'b'.repeat(21000) + ' FINAL-INSTRUCTION'
+  const messages = [{ role: 'system', content: system(10000) }, { role: 'user', content: brief }]
+  const { payload, said } = await run({ model: 'fast', messages, tools: tools(9) })
+  assert.ok(!said.includes('当前消息过长'), `no turn cut: ${said}`)
+  assert.ok(payload.text.includes('FINAL-INSTRUCTION'), 'the brief arrives whole')
+  assert.ok(!payload.text.includes('middle truncated'), 'no cut marker inside the brief')
+})
