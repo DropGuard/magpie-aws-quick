@@ -13,15 +13,16 @@
 // handler.ts's runTurn only streams an AttemptPlan, retries it, and writes the
 // session entry back. Budget arithmetic lives in protocol/frame.ts; this module
 // decides WHAT goes into the frame, never how many bytes it may take.
+import crypto from 'node:crypto'
 import { QuickWsError } from '../quickws.ts'
 import { normalizeTools, buildToolPreamble } from '../tools.ts'
 import {
-  renderTranscript, renderDelta, renderToolCalls, textOf, byteLen, capText, setInstructions,
+  renderTranscript, renderDelta, renderToolCalls, textOf, byteLen, capText, capMiddle, setInstructions, canonRole,
 } from '../translate.ts'
 import type { RenderStats } from '../translate.ts'
 import { resolveReuse } from './reuse.ts'
 import type { Reuse } from './reuse.ts'
-import { pickTurnImages, createAttachmentFlow, CONTEXT_ATTACHED_NOTE, TOO_LONG_ERR } from './attachments.ts'
+import { pickTurnImages, createAttachmentFlow, CONTEXT_ATTACHED_NOTE, TOO_LONG_ERR, TOOL_UPLOAD_MIN } from './attachments.ts'
 import { PLAIN_TEXT_NOTE, TOOLS_STILL_APPLY, INVALID_CALL_TOOL, cutNote } from './prompts.ts'
 import { frameRoom, pickPreamble } from '../protocol/frame.ts'
 
@@ -56,7 +57,10 @@ export interface TurnContext {
   fitPreamble: (list?: any[], need?: number) => string
   uploadAll: (tid: string) => Promise<{ entries: any[]; failed: number }>
   attachContext: (tid: string) => Promise<any>
+  /** Pointer text for a transcript replaced by `entry`, with a recent tail. */
   attachPointer: (entry: any, headroom: number) => string
+  /** Upload one oversized tool result (null when it could not be delivered). */
+  uploadToolResult: (tid: string, name: string, text: string) => Promise<any | null>
   imageNoteFor: (failed: number) => string
   currentTurnNeed: number
   canonClientTool: (name: any) => string | null
@@ -186,15 +190,47 @@ export function buildTurnContext({ body, outpost, sessions, options, signal, sys
   const images = pickTurnImages({ convo, reuse, textBudget })
   const turnBudget = textBudget - images.bytes
   const frameCap = textCap - images.bytes
-  const { imageNoteFor, uploadAll, attachContext, attachPointer } = createAttachmentFlow({ outpost, options, signal, convo, images })
+  const { imageNoteFor, uploadAll, attachContext, attachPointer, uploadToolResult } = createAttachmentFlow({ outpost, options, signal, convo, images })
 
   return {
     convo, tools, mode,
     systemText, base, customPrompt, preamble, textCap, textBudget, turnBudget, frameCap,
     scope, hashes, sessionKey, reuse, taken, stats, mark, mergeStats, fitPreamble,
-    uploadAll, attachContext, attachPointer, imageNoteFor, currentTurnNeed,
+    uploadAll, attachContext, attachPointer, uploadToolResult, imageNoteFor, currentTurnNeed,
     canonClientTool, showQuickTools, images, toolNames, options, signal,
   }
+}
+
+/**
+ * Replace oversized tool results with a pointer + a small head/tail preview,
+ * uploading the full text. Used when the frame had to cut tool output: the
+ * model keeps the useful ends and can read the middle from the file.
+ * Returns the rewritten messages, or null when nothing could be uploaded.
+ */
+async function swapBigToolResults(ctx: TurnContext, threadId: string, messages: any[], attachments: any[], opts: { startAt?: number; cap: number }): Promise<any[] | null> {
+  const start = opts.startAt ?? 0
+  const floor = Math.max(TOOL_UPLOAD_MIN, opts.cap)
+  const big = messages
+    .map((m, i) => ({ m, i }))
+    .filter(({ m, i }) => i >= start && canonRole(m.role) === 'tool' && byteLen(textOf(m.content)) > floor)
+    .sort((a, b) => byteLen(textOf(b.m.content)) - byteLen(textOf(a.m.content)))
+    .slice(0, 2)
+  if (!big.length) return null
+  const swapped = [...messages]
+  const uploaded: any[] = []
+  for (const { m, i } of big) {
+    const body = textOf(m.content)
+    const name = `tool_${crypto.randomUUID().slice(0, 8)}.txt`
+    const entry = await ctx.uploadToolResult(threadId, name, body)
+    if (!entry) continue
+    uploaded.push(entry)
+    const id = m.tool_call_id || m.name || 'tool'
+    const preview = capMiddle(body, 4096)
+    swapped[i] = { ...m, content: `[tool_result ${id} — ${byteLen(body)} bytes; the full output is in the attached file ${entry.name}. Read that file when the middle of the output matters.]\n${preview}` }
+  }
+  if (!uploaded.length) return null
+  attachments.push(...uploaded)
+  return swapped
 }
 
 /**
@@ -230,12 +266,38 @@ export async function composeAttempt(ctx: TurnContext, { threadId, reuse, retry 
       } Any error for ${INVALID_CALL_TOOL} below is just the placeholder for that failed call.]\n\n`
       : ''
     const prefix = salvagePrefix + droppedPrefix
-    text = prefix + renderDelta(reuse.delta, { maxBytes: ctx.turnBudget - byteLen(prefix), stats: ctx.stats }) + imageNote
+    const budget = ctx.turnBudget - byteLen(prefix)
+    let local: RenderStats = {}
+    let rendered = renderDelta(reuse.delta, { maxBytes: budget, stats: local })
+    if (local.cut?.tool) {
+      const swapped = await swapBigToolResults(ctx, threadId, reuse.delta, attachments, { cap: Math.max(16 * 1024, budget - 2048) })
+      if (swapped) {
+        local = {}
+        rendered = renderDelta(swapped, { maxBytes: budget, stats: local })
+      }
+    }
+    ctx.mergeStats(local)
+    text = prefix + rendered + imageNote
     reused = true
   } else {
     local = {}
-    text = renderTranscript(ctx.convo, '', { maxBytes: ctx.turnBudget, stats: local }) + imageNote
+    let rendered = renderTranscript(ctx.convo, '', { maxBytes: ctx.turnBudget, stats: local })
+    // A fresh frame can still carry this turn's tool results (after a re-thread
+    // the client resends the conversation). Cutting one is the same loss as on
+    // a reused turn, so the same upload applies — but only to results after the
+    // last assistant message: earlier ones are deliberately stale (2 KB cap).
+    if (!local.dropped && local.cut?.tool) {
+      let lastAsst = -1
+      for (let i = ctx.convo.length - 1; i >= 0; i--) if (canonRole(ctx.convo[i]?.role) === 'assistant') { lastAsst = i; break }
+      const cap = Math.max(16 * 1024, ctx.turnBudget - 2048)
+      const swapped = await swapBigToolResults(ctx, threadId, ctx.convo, attachments, { startAt: lastAsst + 1, cap })
+      if (swapped) {
+        local = {}
+        rendered = renderTranscript(swapped, '', { maxBytes: ctx.turnBudget, stats: local })
+      }
+    }
     ctx.mergeStats(local)
+    text = rendered + imageNote
     // History that had to be dropped from the frame is not thrown away: it
     // rides an attachment and the message only points at it.
     if (local.dropped) {

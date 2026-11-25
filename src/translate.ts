@@ -443,6 +443,30 @@ export function renderTranscript(messages: any[], systemText: string, { maxBytes
 }
 
 /**
+ * The newest messages rendered exactly as the transcript renders them, capped
+ * to maxBytes. Used when the whole transcript went to an attachment: the frame
+ * repeats this tail so the model can continue without a file read.
+ */
+export function renderTail(messages: any[], maxBytes: number): string {
+  const out: string[] = []
+  let used = 0
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    const tool = isTool(m)
+    const head = tool ? toolHead(m) : ''
+    let body = tool ? textOf(m.content) : transcriptLine(m, () => {}, Infinity)
+    const room = maxBytes - used - (head ? byteLen(head) + 1 : 0)
+    if (room <= 0) break
+    if (byteLen(body) > room) body = tool ? shrinkTool(body, room) : capMiddle(body, room)
+    const piece = head ? `${head}\n${body}` : body
+    out.unshift(piece)
+    used += byteLen(piece) + 2
+    if (used >= maxBytes) break
+  }
+  return out.join('\n\n')
+}
+
+/**
  * Delta text for a REUSED thread: only the new user/tool content.
  * Per-block caps apply first (TOOL_RESULT_CAP / USER_TURN_CAP); then tool
  * results share the remaining budget (fitBlocks) — the current turn's

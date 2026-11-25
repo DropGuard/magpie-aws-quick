@@ -122,6 +122,10 @@ export async function startFakeQuick({ script, session, connectError, staleStop 
   const sockets = new Set()
 
   const server = createServer()
+  // Anything that is not a WebSocket upgrade is not part of this fake: answer
+  // 404 immediately so a stray HTTP call (e.g. an attachment upload) fails
+  // fast instead of parking the client until its own timeout.
+  server.on('request', (_req, res) => { res.writeHead(404, { 'content-type': 'text/plain' }); res.end('not found') })
   server.on('upgrade', (req, socket) => {
     const key = req.headers['sec-websocket-key']
     if (!key) { socket.destroy(); return }

@@ -7,7 +7,7 @@
 // cutting the middle is what made the model "forget" the task).
 import crypto from 'node:crypto'
 import { uploadFile, uploadImage } from '../attach.ts'
-import { renderTranscript, textOf, byteLen, capMiddle, canonRole, pickImages } from '../translate.ts'
+import { renderTranscript, renderTail, textOf, byteLen, capMiddle, canonRole, pickImages } from '../translate.ts'
 
 // A transcript that cannot fit one 64 KB frame travels as a cloud attachment
 // (the desktop upload flow takes text files). Refuse absurd sizes rather than
@@ -17,6 +17,10 @@ export const CONTEXT_ATTACHED_NOTE = '上下文超过 Quick 64KB 单帧上限，
 export const TOO_LONG_ERR = "context_length_exceeded: the conversation does not fit Amazon Quick's 64 KB message limit and uploading it as a context attachment failed"
 // Text room kept free when inline images claim the frame.
 const IMAGE_TEXT_RESERVE = 8 * 1024
+/** A tool result above this size, when the frame had to cut it, is uploaded
+ *  instead: the file keeps all of it and the frame points at the file. */
+export const TOOL_UPLOAD_MIN = 32 * 1024
+const TOOL_UPLOADS_PER_TURN = 2
 
 /**
  * Split this turn's images into inline / upload / skipped, against the text
@@ -35,8 +39,22 @@ export interface AttachmentFlow {
   uploadAll: (tid: string) => Promise<{ entries: any[]; failed: number }>
   /** Upload the full conversation as a text file (null when disabled). */
   attachContext: (tid: string) => Promise<any>
-  /** Pointer text for a transcript replaced by `entry`. */
+  /** Pointer text for a transcript replaced by `entry`, with a recent tail. */
   attachPointer: (entry: any, headroom: number) => string
+  /** Upload one oversized tool result; null when it could not be delivered. */
+  uploadToolResult: (tid: string, name: string, text: string) => Promise<any | null>
+}
+
+/** Bound a best-effort upload: an unresponsive endpoint must not hold the turn. */
+function withTimeout(signal: AbortSignal | undefined, ms: number): AbortSignal {
+  const ctl = new AbortController()
+  const timer = setTimeout(() => ctl.abort(), ms)
+  timer.unref?.()
+  if (signal) {
+    if (signal.aborted) ctl.abort()
+    else signal.addEventListener('abort', () => ctl.abort(), { once: true })
+  }
+  return ctl.signal
 }
 
 export function createAttachmentFlow({ outpost, options, signal, convo, images }: {
@@ -102,20 +120,34 @@ export function createAttachmentFlow({ outpost, options, signal, convo, images }
       signal,
     })
   }
-  // Pointer text for a transcript replaced by `entry`: the newest message rides
-  // along so the model can act without waiting for a file read.
+  // Pointer text for a transcript replaced by `entry`: the most recent turns
+  // are repeated inside the frame, so the model can act without a file read;
+  // the file holds everything older.
   const attachPointer = (entry: any, headroom: number) => {
-    const last = convo.at(-1)
-    let tail = ''
-    if (last) {
-      const role = canonRole(last.role)
-      const body = textOf(last.content)
-      if (role === 'tool') tail = `[tool_result ${[last.name, last.tool_call_id].filter(Boolean).join(' ')}]\n${body}`
-      else if (role === 'user') tail = body
-    }
-    const lead = `[The conversation so far is in the attached file ${entry.name} (${entry.size} bytes). It was too long to send as one message. Read the whole file with your file tool before anything else, then continue from it exactly as if its text had been sent here. Do not mention the file or that you are reading it.]`
-    if (!tail) return lead
-    return `${lead}\n\n${capMiddle(tail, Math.max(2 * 1024, headroom - byteLen(lead) - 256))}`
+    const lead = `[The conversation so far is in the attached file ${entry.name} (${entry.size} bytes). It was too long to send as one message: older turns are only in that file — read it with your file tool when you need anything before the messages below. The most recent messages are repeated here so you can continue right away.]`
+    const room = Math.max(2 * 1024, headroom - byteLen(lead) - 256)
+    const tail = renderTail(convo, room)
+    return tail ? `${lead}\n\n${tail}` : lead
   }
-  return { imageNoteFor, uploadAll, attachContext, attachPointer }
+  // Best-effort: when the frame had to cut a huge tool result, the full output
+  // goes to a file and the frame keeps a pointer. A failed upload falls back to
+  // the truncation the caller already rendered.
+  const uploadToolResult = async (tid: string, name: string, text: string) => {
+    try {
+      const sess = await outpost.session()
+      const devId = await Promise.resolve(outpost.outpostId?.()).catch(() => '')
+      return await uploadFile({
+        session: sess, name, mimeType: 'text/plain', bytes: Buffer.from(text, 'utf8'),
+        threadId: tid, outpostId: devId || undefined,
+        fetchImpl: options?.fetchImpl ?? globalThis.fetch,
+        // best-effort: a dead endpoint falls back to the truncation, quickly
+        signal: withTimeout(signal, 20_000),
+      })
+    } catch (e: any) {
+      if (signal?.aborted || e?.name === 'AbortError') throw e
+      options?.log?.(`[aws-quick] tool-result upload failed: ${String(e?.message ?? e).slice(0, 200)}`)
+      return null
+    }
+  }
+  return { imageNoteFor, uploadAll, attachContext, attachPointer, uploadToolResult }
 }

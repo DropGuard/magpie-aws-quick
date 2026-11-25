@@ -1,6 +1,10 @@
 #!/usr/bin/env node
-// Differential check: the TypeScript tree against the reference .mjs tree that
-// magpie currently serves.
+// Differential check: the TypeScript tree against the historical .mjs tree.
+//
+// The TypeScript tree is the deployed implementation now; this harness is a
+// reference check, not a release gate. It catches accidental drift in the
+// scenarios both trees still share, and any deliberate difference is listed in
+// KNOWN_DIFFS with its reason.
 //
 // The test suite proves "the same assertions still hold". This proves the
 // stronger claim the port needs: for identical input, both implementations
@@ -153,6 +157,7 @@ function normalize(v) {
       .replace(/call_[0-9a-f]{24}/g, '<call>')
       .replace(/chatcmpl-quick-[0-9a-f]{8}-[0-9a-z]+/g, '<completion>')
       .replace(/context_[0-9a-f]{8}\.txt/g, 'context_<rand>.txt')
+      .replace(/tool_[0-9a-f]{8}\.txt/g, 'tool_<rand>.txt')
   }
   return v
 }
@@ -176,6 +181,10 @@ const PSEUDO200 = "You've reached your usage limit. Check your profile for detai
 // Intentional divergences from the reference tree, each with the reason it is
 // an improvement rather than drift. Everything else must match byte for byte.
 const KNOWN_DIFFS = {
+  'oversize transcript becomes an attachment (stream), then reuses':
+    'TS repeats the most recent turns inline beside the pointer; the reference sends only the newest message',
+  'a huge tool result is uploaded instead of truncated':
+    'TS uploads the full output and points at the file (head+tail inline); the reference truncates the middle',
   'guardrail stop is retried on the same thread':
     'TS keeps the turn text and appends the nudge; the reference replaced the whole message with it (the model lost the request)',
   'guardrail budget spent surfaces the labelled error':
@@ -286,6 +295,38 @@ const SCENARIOS = {
     })
   },
 
+  'a huge tool result is uploaded instead of truncated': async (impl, identity) => {
+    let turn = 0
+    return withFake(impl, identity, {
+      fetchImpl: attachFetch(),
+      script: (p) => {
+        turn++
+        if (turn === 1) {
+          return [
+            { type: 'text_delta', payload: { delta: 'Reading. <tool_call>{"name":"Read","arguments":{"file_path":"big.txt"}}</tool_call>' } },
+            { type: 'message_complete', payload: { text: '' } },
+          ]
+        }
+        return defaultScript(p)
+      },
+    }, async ({ call, wire }) => {
+      const u1 = { role: 'user', content: 'read big.txt' }
+      const r1 = await call({ model: 'fast', messages: [u1], tools: [fnTool('Read')] })
+      const message = r1.response.json.choices[0].message
+      const huge = 'MEGA-HEAD\n' + 'm'.repeat(120 * 1024) + '\nMEGA-MIDDLE\n' + 'm'.repeat(120 * 1024) + '\nMEGA-TAIL'
+      const r2 = await call({
+        model: 'fast',
+        tools: [fnTool('Read')],
+        messages: [
+          u1,
+          { role: 'assistant', content: message.content, tool_calls: message.tool_calls },
+          { role: 'tool', tool_call_id: message.tool_calls[0].id, content: huge },
+        ],
+      })
+      return { wire: wire(), responses: [r1, r2] }
+    })
+  },
+
   'invalid <tool_call> becomes the placeholder, then is restated': async (impl, identity) => {
     let n = 0
     return withFake(impl, identity, {
@@ -359,6 +400,7 @@ const CHECKS = {
     assert.ok(atts.some((a) => a.type === 'file' && a.mimeType === 'text/plain'), 'transcript uploaded as a file')
     assert.match(text(run, 0), /attached file context_<rand>\.txt/)
     assert.match(JSON.stringify(run.responses[0].response), /附件/)
+    assert.match(text(run, 0), /ANSWER-19-/, 'recent turns ride inline with the pointer')
     assert.ok(!JSON.stringify(run.responses[1].response).includes('附件'), 'the note is not repeated once the thread continues')
   },
   'inline image stays inline (non-stream)': (run) => {
@@ -386,6 +428,13 @@ const CHECKS = {
     assert.equal(run.wire.length, 3, 'no attempt after the fresh retry')
     assert.notEqual(run.wire[2].thread, run.wire[1].thread)
     assert.match(run.responses[1].response.json.error.message, /审核拦截/)
+  },
+  'a huge tool result is uploaded instead of truncated': (run) => {
+    const payload = run.wire[1].payload
+    assert.ok((payload.attachments ?? []).some((a) => a.type === 'file' && a.mimeType === 'text/plain'), 'the full output is attached')
+    assert.match(text(run, 1), /full output is in the attached file tool_<rand>\.txt/)
+    assert.ok(!text(run, 1).includes('MEGA-MIDDLE'), 'no truncated middle in the frame')
+    assert.match(text(run, 1), /MEGA-TAIL/, 'the tail still rides inline')
   },
   'invalid <tool_call> becomes the placeholder, then is restated': (run) => {
     assert.equal(run.responses[0].response.json.choices[0].message.tool_calls[0].function.name, 'aws_quick_invalid_tool_call')

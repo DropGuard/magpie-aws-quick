@@ -1407,6 +1407,7 @@ test('a fresh thread too large for one frame sends the conversation as an attach
   // The frame keeps a pointer + the current question, not a gutted transcript.
   assert.match(payload.text, /is in the attached file context_[0-9a-f]{8}\.txt/)
   assert.ok(payload.text.includes('FINAL-ASK'), 'the current turn rides along')
+  assert.ok(payload.text.includes('ANSWER-19-'), 'the most recent turns are repeated inline')
   assert.ok(!payload.text.includes('QUESTION-0-'), 'old turns are not crammed back into the frame')
   // The whole conversation, but no per-block caps, went up as one text file.
   const up = payload.attachments.find((a) => a.type === 'file')
@@ -1754,6 +1755,90 @@ test('a guardrail retry on a reused thread keeps this turn\'s tool result', asyn
     assert.equal(msgs[2].payload.threadId, msgs[1].payload.threadId, 'retry stays on the reused thread')
     assert.match(msgs[2].payload.text, /\[tool_result/, 'the delta (tool result) is not lost')
     assert.match(msgs[2].payload.text, /Continue the previous request/, 'the nudge is appended')
+  } finally {
+    await f.close()
+  }
+})
+
+test('a huge tool result on a reused thread is uploaded instead of truncated', async () => {
+  let turn = 0
+  const { fn, calls } = attachFetch()
+  const f = await startFakeQuick({
+    script: (p) => {
+      turn++
+      if (turn === 1) {
+        return [
+          { type: 'text_delta', payload: { delta: 'Reading. <tool_call>{"name":"Read","arguments":{"file_path":"big.txt"}}</tool_call>' } },
+          { type: 'message_complete', payload: { text: '' } },
+        ]
+      }
+      return defaultScript(p)
+    },
+  })
+  const sessions = createSessionStore()
+  try {
+    const r1 = await handleChatCompletions({
+      body: { model: 'fast', messages: [{ role: 'user', content: 'read big.txt' }], tools: [fnTool('Read')] },
+      outpostMgr: fakeMgr(f), sessions, options: { identity: 'big-result', log: () => {} },
+    })
+    const m1 = (await r1.json()).choices[0].message
+    const huge = 'MEGA-HEAD\n' + 'm'.repeat(120 * 1024) + '\nMEGA-MIDDLE\n' + 'm'.repeat(120 * 1024) + '\nMEGA-TAIL'
+    const r2 = await handleChatCompletions({
+      body: {
+        model: 'fast',
+        tools: [fnTool('Read')],
+        messages: [
+          { role: 'user', content: 'read big.txt' },
+          { role: 'assistant', content: m1.content, tool_calls: m1.tool_calls },
+          { role: 'tool', tool_call_id: m1.tool_calls[0].id, content: huge },
+        ],
+      },
+      outpostMgr: fakeMgr(f), sessions,
+      options: { identity: 'big-result', log: () => {}, fetchImpl: fn },
+    })
+    assert.equal(r2.status, 200)
+    const payload = f.state.userMessages.at(-1).payload
+    const up = (payload.attachments ?? []).find((a) => a.type === 'file' && a.mimeType === 'text/plain')
+    assert.ok(up, 'the full tool output is attached as a file')
+    assert.match(payload.text, /full output is in the attached file tool_[0-9a-f]{8}\.txt/, 'the frame points at the file')
+    assert.ok(!payload.text.includes('MEGA-MIDDLE'), 'the frame no longer carries a truncated middle')
+    assert.ok(payload.text.includes('MEGA-TAIL'), 'the newest bytes still reach the model')
+    const upCall = calls.find((c) => c.url.includes('upload-attachment'))
+    assert.ok(upCall, 'upload flow used')
+    const threadId = f.state.userMessages.at(-1).threadId
+    const deliver = JSON.parse(calls.filter((c) => c.url.includes('qbs-event')).at(-1).init.body).eventBody.invokeAgent
+    assert.equal(deliver.path, `files/upload/${threadId}`)
+  } finally {
+    await f.close()
+  }
+})
+
+test('a huge tool result on a fresh frame is uploaded too', async () => {
+  const { fn } = attachFetch()
+  const f = await startFakeQuick({})
+  try {
+    const huge = 'MEGA-HEAD\n' + 'm'.repeat(120 * 1024) + '\nMEGA-MIDDLE\n' + 'm'.repeat(120 * 1024) + '\nMEGA-TAIL'
+    const res = await handleChatCompletions({
+      body: {
+        model: 'fast',
+        tools: [fnTool('Read')],
+        messages: [
+          { role: 'user', content: 'read big.txt' },
+          { role: 'assistant', content: 'Reading.', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'Read', arguments: '{}' } }] },
+          { role: 'tool', tool_call_id: 'call_1', content: huge },
+        ],
+      },
+      outpostMgr: fakeMgr(f),
+      sessions: createSessionStore(),
+      options: { identity: 'fresh-big', log: () => {}, fetchImpl: fn },
+    })
+    assert.equal(res.status, 200)
+    const payload = f.state.userMessages.at(-1).payload
+    const up = (payload.attachments ?? []).find((a) => a.type === 'file' && a.mimeType === 'text/plain')
+    assert.ok(up, 'the full output is attached on a fresh frame too')
+    assert.match(payload.text, /full output is in the attached file tool_[0-9a-f]{8}\.txt/)
+    assert.ok(!payload.text.includes('MEGA-MIDDLE'), 'no truncated middle')
+    assert.ok(payload.text.includes('MEGA-TAIL'), 'the tail still rides inline')
   } finally {
     await f.close()
   }
