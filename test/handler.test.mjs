@@ -1480,3 +1480,24 @@ test('a shrunk tool result says so instead of blaming the context size', async (
   assert.match(said, /缩小范围重跑/)
   assert.ok(!said.includes('已截断较早内容'))
 })
+
+test('a big caller system prompt is not clipped when the frame has room (escaped sizes count)', async () => {
+  // The reserve used the raw byte length, but the frame is JSON: every newline
+  // in the system prompt costs two bytes. That left the frame ~1.7 KB short and
+  // clipped the caller's rules while a 16 KB duplicated <system-reminder> rode
+  // in the message. Both are now handled: escaped sizes are reserved, and the
+  // reminder is squeezed before the user's own words are ever cut.
+  const system = 'Rule line with a "quote" and a tab\tand text.\n'.repeat(320)
+  const messages = [
+    { role: 'system', content: system },
+    { role: 'user', content: '<system-reminder>' + 'x'.repeat(16000) + '</system-reminder>\n\nDo the thing I asked.' },
+  ]
+  const res = await req({ model: 'fast', stream: true, messages, tools: [fnTool('Read')] })
+  assert.equal(res.status, 200)
+  const payload = fake.state.userMessages.at(-1).payload
+  assert.ok(payload.custom_prompt.endsWith(system), 'the caller system prompt arrives whole')
+  assert.ok(payload.text.includes('Do the thing I asked.'), 'the user words survive')
+  const events = await readSse(res)
+  const said = events.map((e) => String(e.choices?.[0]?.delta?.content ?? '')).join('')
+  assert.ok(!said.includes('系统指令过长'), `no system clip note: ${said}`)
+})
