@@ -180,3 +180,35 @@ test('a take() is not resurrected by another instance writing later', async () =
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('session-key fallback does not splice a plain follow-up into another chat', async () => {
+  const { resolveReuse } = await import('../src/turn/reuse.ts')
+  const sessions = createSessionStore()
+  const scope = sessionScope('acct', 'smart', 'sys', null)
+  const sk = `sess:${scope}:shared-key`
+  sessions.set(sk, { threadId: 'thread-other', callIds: ['call_a'] })
+  const convo = [
+    { role: 'user', content: 'hello' },
+    { role: 'assistant', content: 'hi' },
+    { role: 'user', content: 'a fresh question after compaction' },
+  ]
+  const d = resolveReuse({ sessions, identity: 'acct', mode: 'smart', systemText: 'sys', convo, sessionKey: 'shared-key' })
+  assert.equal(d.reuse, undefined, 'a plain user message must not resume a colliding session key')
+  assert.equal(sessions.has(sk), true, 'the entry stays for the chat that owns it')
+})
+
+test('session-key fallback resumes tool results that answer this thread', async () => {
+  const { resolveReuse } = await import('../src/turn/reuse.ts')
+  const sessions = createSessionStore()
+  const scope = sessionScope('acct', 'smart', 'sys', null)
+  const sk = `sess:${scope}:owned-key`
+  sessions.set(sk, { threadId: 'thread-ours', callIds: ['call_a'] })
+  const convo = [
+    { role: 'user', content: 'q' },
+    { role: 'assistant', content: 'a' },
+    { role: 'tool', tool_call_id: 'call_a', content: 'result' },
+  ]
+  const d = resolveReuse({ sessions, identity: 'acct', mode: 'smart', systemText: 'sys', convo, sessionKey: 'owned-key' })
+  assert.equal(d.reuse?.entry.threadId, 'thread-ours')
+  assert.equal(d.reuse?.delta.length, 1)
+})

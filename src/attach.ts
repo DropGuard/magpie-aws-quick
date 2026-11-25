@@ -43,6 +43,38 @@ function attachBase(session) {
   return `${http}/integration/quick-work/`
 }
 
+/** Overall bound for the attachment flow: an endpoint that accepts and never
+ *  answers must not hold a turn. 0 disables it (callers that pass their own). */
+const DEFAULT_FLOW_TIMEOUT_MS = 0
+
+/**
+ * Run the attachment flow with an overall deadline. The deadline aborts the
+ * flow's own signal; a caller's abort still surfaces as an abort, and the
+ * timeout surfaces as reason 'timeout' so callers can tell them apart.
+ */
+export function uploadFile(p) {
+  const timeoutMs = Number(p?.timeoutMs) > 0 ? Number(p.timeoutMs) : DEFAULT_FLOW_TIMEOUT_MS
+  const outer = p?.signal
+  if (!timeoutMs) return uploadFileInner(p)
+  const ctl = new AbortController()
+  const timer = setTimeout(() => ctl.abort(), timeoutMs)
+  timer.unref?.()
+  const link = () => ctl.abort()
+  if (outer) {
+    if (outer.aborted) ctl.abort()
+    else outer.addEventListener('abort', link, { once: true })
+  }
+  return uploadFileInner({ ...p, signal: ctl.signal })
+    .catch((e) => {
+      if (ctl.signal.aborted && !outer?.aborted) throw fail('timeout', `attachment flow did not finish within ${timeoutMs}ms`)
+      throw e
+    })
+    .finally(() => {
+      clearTimeout(timer)
+      outer?.removeEventListener?.('abort', link)
+    })
+}
+
 /**
  * Upload one file through Quick's cloud attachment flow. The desktop flow
  * takes any content type — inline images and plain-text conversation dumps
@@ -59,10 +91,11 @@ function attachBase(session) {
  * @param {AbortSignal} [p.signal]
  * @param {number} [p.pollMs]  DLP poll interval (default 1500)
  * @param {number} [p.maxPolls] DLP poll budget (default 40)
+ * @param {number} [p.timeoutMs] overall deadline for the whole flow (0 = none)
  * @returns {Promise<object>} user_message attachment entry (no `data`)
  * @throws {Error} with .reason ∈ 'upload'|'dlp'|'deliver'|'timeout'|'auth'
  */
-export async function uploadFile({ session, name, mimeType = 'application/octet-stream', bytes, threadId, outpostId, fetchImpl = globalThis.fetch, signal, pollMs = 1500, maxPolls = 40 }) {
+async function uploadFileInner({ session, name, mimeType = 'application/octet-stream', bytes, threadId, outpostId, fetchImpl = globalThis.fetch, signal, pollMs = 1500, maxPolls = 40 }) {
   const token = session?.id_token
   if (!token) throw fail('auth', 'session has no id_token')
   const base = attachBase(session)
@@ -175,7 +208,7 @@ export async function uploadFile({ session, name, mimeType = 'application/octet-
 }
 
 /** Upload one inline image ({mimeType, data(base64)}) — the image shorthand. */
-export function uploadImage({ session, image, name, threadId, outpostId, fetchImpl, signal, pollMs, maxPolls }: {
+export function uploadImage({ session, image, name, threadId, outpostId, fetchImpl, signal, pollMs, maxPolls, timeoutMs }: {
   session: any
   image: any
   name?: string
@@ -185,6 +218,7 @@ export function uploadImage({ session, image, name, threadId, outpostId, fetchIm
   signal?: AbortSignal
   pollMs?: number
   maxPolls?: number
+  timeoutMs?: number
 }) {
   return uploadFile({
     session,
@@ -197,5 +231,6 @@ export function uploadImage({ session, image, name, threadId, outpostId, fetchIm
     signal,
     pollMs,
     maxPolls,
+    timeoutMs,
   })
 }

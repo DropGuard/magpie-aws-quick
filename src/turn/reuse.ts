@@ -92,14 +92,15 @@ export function resolveReuse({ sessions, identity, mode, systemText, convo, sess
         const delta = convo.slice(a + 1)
         if (delta.length && delta.every((m) => ['user', 'tool', 'function'].includes(canonRole(m.role)))) {
           const entry = sessions.take(sk)
-          // One session id covers every subagent of a Claude Code session
-          // (and a gateway may move each request to another account), so the
-          // id alone can splice one subagent's tool results into another
-          // subagent's thread. Tool results must answer calls this thread
-          // made; a plain user follow-up still resumes.
+          // The id alone is not proof: magpie's session key has been observed
+          // stable across DIFFERENT Claude chats (same project/system), so it
+          // can point at another conversation's thread. A tool-result delta is
+          // proof only when every result answers a call this thread made — and
+          // it must contain at least one, otherwise `every` is vacuously true
+          // and a plain user message would be appended to a stranger's thread.
           const resultIds = delta.filter((m) => canonRole(m.role) === 'tool').map((m) => m.tool_call_id).filter(Boolean)
           const ours = new Set(entry?.callIds ?? [])
-          if (entry && resultIds.every((id) => ours.has(id))) {
+          if (entry && resultIds.length > 0 && resultIds.every((id) => ours.has(id))) {
             taken.push([sk, entry])
             sessHit = { entry, delta }
           } else if (entry) sessions.set(sk, entry)

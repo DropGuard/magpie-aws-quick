@@ -102,7 +102,8 @@ export async function quickUsage(getSession, { fetchImpl, signal }: { fetchImpl?
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sess.id_token}`, 'x-amzn-qs-internal-trace-id': crypto.randomUUID() },
       body: JSON.stringify({ eventType: type, eventBody: { [type]: { awsAccountId: sess.aws_account_id || '' } } }),
-      signal,
+      // a probe must fail fast; the card shows the error instead
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
     })
     if (r.status === 401 || r.status === 403) return { error: 'Amazon Quick 登录已失效，请重新登录', signIn: 'expired' }
     const j = await r.json().catch(() => null)
@@ -183,7 +184,7 @@ export async function profileUsage(getSession, { fetchImpl, signal }: { fetchImp
         eventType: 'invokeAgent',
         eventBody: { invokeAgent: { path: 'profile/usage', queryParams: { _method: 'GET' }, body: {} } },
       }),
-      signal,
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
     })
     if (r.status === 401 || r.status === 403) return { error: 'Amazon Quick 登录已失效，请重新登录', signIn: 'expired' }
     const j = await r.json().catch(() => null)

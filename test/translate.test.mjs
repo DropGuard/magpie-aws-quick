@@ -166,7 +166,10 @@ test('renderDelta keeps small results whole and squeezes only the large one', ()
   assert.ok(byteLen(out) <= 8 * 1024)
   assert.ok(out.includes('tiny output'))
   assert.ok(out.includes('HEAD') && out.includes('TAIL-ERROR')) // head + tail both survive
-  assert.ok(out.includes('re-run the tool'))
+  // The marker must not invite a repeat of the identical call: that returns
+  // the same cut. It asks for the missing range instead.
+  assert.ok(out.includes('Repeating the same call returns the same cut'))
+  assert.ok(out.includes('missing range'))
 })
 
 test('renderDelta still drops oldest text when conversation text alone overflows', () => {

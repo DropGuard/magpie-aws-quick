@@ -253,9 +253,9 @@ function tailBytes(s, max) {
 function shrinkTool(body, max) {
   const total = byteLen(body)
   if (total <= max) return body
-  const mark = `\n…[${total}-byte result, middle omitted to fit Quick's frame — re-run the tool with a narrower range if you need it]…\n`
+  const mark = `\n…[${total}-byte result: middle omitted to fit Quick's frame. Repeating the same call returns the same cut — request only the missing range (offset/limit) if you need it.]…\n`
   const room = max - byteLen(mark)
-  if (room < 256) return `[${total}-byte result omitted to fit Quick's frame — re-run the tool if you need it]`
+  if (room < 256) return `[${total}-byte result omitted to fit Quick's frame — request a narrower range (offset/limit); repeating the same call returns the same cut]`
   const head = fitBytes(body, Math.floor((room * 2) / 3))
   return head + mark + tailBytes(body, room - byteLen(head))
 }

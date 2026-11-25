@@ -324,7 +324,7 @@ test('fuzzy resume rejects when the tail window itself was rewritten', async () 
   assert.notEqual(msgs.at(-1).threadId, msgs.at(-2).threadId, 'tail rewrite must not fuzzy-match')
 })
 
-test('session-key fallback resumes when history is rewritten beyond anchors', async () => {
+test('a plain follow-up with a colliding session key starts a fresh thread', async () => {
   const sessions = createSessionStore()
   const u1 = { role: 'user', content: 'q1' }
   const call = (messages, sessionKey) => handleChatCompletions({
@@ -345,8 +345,12 @@ test('session-key fallback resumes when history is rewritten beyond anchors', as
   assert.equal(r2.status, 200)
   await r2.json()
   const msgs = fake.state.userMessages
-  assert.equal(msgs.at(-1).threadId, msgs.at(-2).threadId, 'session key must resume the thread')
-  assert.equal(msgs.at(-1).payload.text, 'q2')
+  // magpie's session key is stable across different chats in one project, so a
+  // delta with no tool results is not proof of identity. The safe outcome is a
+  // fresh thread carrying the whole conversation, not a possible splice.
+  assert.notEqual(msgs.at(-1).threadId, msgs.at(-2).threadId, 'must not splice on the key alone')
+  assert.match(msgs.at(-1).payload.text, /q1 REWRITTEN/, 'the transcript is re-sent')
+  assert.ok(msgs.at(-1).payload.text.includes('q2'), 'the new message rides along')
 })
 
 test('session-key does not leak across different session ids', async () => {
@@ -1473,7 +1477,12 @@ test('a shrunk tool result says so instead of blaming the context size', async (
     // Past the whole frame budget (~52 KB), so this one really has to be cut.
     { role: 'tool', tool_call_id: 'call_big', content: 'L'.repeat(80000) },
   ]
-  const res = await req({ model: 'fast', stream: true, messages, tools: [fnTool('Read')] })
+  // No upload backend for this turn: the upgrade to a file must fail fast and
+  // fall back to the truncation (which the note then names).
+  const res = await req(
+    { model: 'fast', stream: true, messages, tools: [fnTool('Read')] },
+    { options: { fetchImpl: async () => { throw new Error('no upload endpoint') } } },
+  )
   assert.equal(res.status, 200)
   const events = await readSse(res)
   const said = events.map((e) => String(e.choices?.[0]?.delta?.content ?? '')).join('')
@@ -1839,6 +1848,120 @@ test('a huge tool result on a fresh frame is uploaded too', async () => {
     assert.match(payload.text, /full output is in the attached file tool_[0-9a-f]{8}\.txt/)
     assert.ok(!payload.text.includes('MEGA-MIDDLE'), 'no truncated middle')
     assert.ok(payload.text.includes('MEGA-TAIL'), 'the tail still rides inline')
+  } finally {
+    await f.close()
+  }
+})
+
+test('an unresponsive upload endpoint cannot hold the turn', async () => {
+  const f = await startFakeQuick({})
+  try {
+    const huge = 'HEAD\n' + 'm'.repeat(120 * 1024) + '\nTAIL'
+    const t0 = Date.now()
+    const res = await handleChatCompletions({
+      body: {
+        model: 'fast',
+        stream: true,
+        tools: [fnTool('Read')],
+        messages: [
+          { role: 'user', content: 'read big.txt' },
+          { role: 'assistant', content: 'Reading.', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'Read', arguments: '{}' } }] },
+          { role: 'tool', tool_call_id: 'c1', content: huge },
+        ],
+      },
+      outpostMgr: fakeMgr(f),
+      sessions: createSessionStore(),
+      // never resolves: only the upload timeout can end this
+      options: {
+        identity: 'dead-upload', log: () => {}, toolUploadTimeoutMs: 30,
+        // A real fetch rejects when its signal aborts; the stub must too,
+        // otherwise only the 300 s watchdog could end the turn.
+        fetchImpl: (_url, init) => new Promise((_, reject) => {
+          const s = init?.signal
+          const abort = () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+          if (s?.aborted) return abort()
+          s?.addEventListener('abort', abort, { once: true })
+        }),
+      },
+    })
+    assert.equal(res.status, 200)
+    const events = await readSse(res)
+    const said = events.map((e) => String(e.choices?.[0]?.delta?.content ?? '')).join('')
+    assert.match(said, /工具结果过大/, 'falls back to the named truncation')
+    assert.ok(Date.now() - t0 < 5_000, `turn must not wait for the watchdog (${Date.now() - t0}ms)`)
+  } finally {
+    await f.close()
+  }
+})
+
+test('a hung context upload fails fast instead of waiting for the watchdog', async () => {
+  const f = await startFakeQuick({})
+  try {
+    // Accepts the request and never answers, but honours abort like a real fetch.
+    const hang = (_url, init) => new Promise((_, reject) => {
+      const s = init?.signal
+      const abort = () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+      if (s?.aborted) return abort()
+      s?.addEventListener('abort', abort, { once: true })
+    })
+    const t0 = Date.now()
+    const res = await handleChatCompletions({
+      body: { model: 'smart', messages: oversizedConvo() },
+      outpostMgr: fakeMgr(f),
+      options: { identity: 'ctx-timeout', log: () => {}, fetchImpl: hang, contextUploadTimeoutMs: 30 },
+    })
+    assert.equal(res.status, 400)
+    const body = await res.json()
+    assert.match(body.error.message, /context_length_exceeded/)
+    assert.ok(Date.now() - t0 < 5_000, `must not wait for the watchdog (${Date.now() - t0}ms)`)
+  } finally {
+    await f.close()
+  }
+})
+
+test('medium tool results that the frame had to cut are uploaded too', async () => {
+  // Three ~20 KB results in one delta share a frame that cannot hold them: the
+  // two largest are uploaded (a file is cheaper than a re-read) and the third
+  // rides whole. Nothing is truncated, so nothing invites a re-read.
+  const { fn } = attachFetch()
+  const f = await startFakeQuick({})
+  const sessions = createSessionStore()
+  const system = 'Rule with a "quote" and a tab\there.\n'.repeat(780) // ~28 KB
+  try {
+    const u1 = { role: 'user', content: 'start' }
+    const r1 = await handleChatCompletions({
+      body: { model: 'fast', messages: [{ role: 'system', content: system }, u1] },
+      outpostMgr: fakeMgr(f), sessions, options: { identity: 'medium-tools', log: () => {} },
+    })
+    const rep1 = (await r1.json()).choices[0].message.content
+    const tool = (id, marker) => ({ role: 'tool', tool_call_id: id, content: `${marker}-HEAD\n` + 'm'.repeat(10 * 1024) + `\n${marker}-MIDDLE\n` + 'm'.repeat(10 * 1024) + `\n${marker}-END` })
+    const res = await handleChatCompletions({
+      body: {
+        model: 'fast',
+        messages: [
+          { role: 'system', content: system },
+          u1,
+          { role: 'assistant', content: rep1 },
+          tool('c1', 'ONE'),
+          tool('c2', 'TWO'),
+          tool('c3', 'THREE'),
+        ],
+      },
+      outpostMgr: fakeMgr(f), sessions,
+      options: { identity: 'medium-tools', log: () => {}, fetchImpl: fn },
+    })
+    assert.equal(res.status, 200)
+    const payload = f.state.userMessages.at(-1).payload
+    const ups = (payload.attachments ?? []).filter((a) => a.type === 'file' && a.mimeType === 'text/plain')
+    assert.equal(ups.length, 2, 'two results uploaded')
+    assert.equal((payload.text.match(/full output is in the attached file tool_[0-9a-f]{8}\.txt/g) ?? []).length, 2, 'two pointers')
+    assert.ok(!payload.text.includes('repeating the same call returns the same cut'), 'no truncation marker anywhere')
+    const whole = ['ONE', 'TWO', 'THREE'].filter((x) => payload.text.includes(`${x}-MIDDLE`))
+    assert.equal(whole.length, 1, 'the un-uploaded result rides whole')
+    assert.ok(payload.text.includes(`${whole[0]}-END`), 'whole means head..end')
+    for (const x of ['ONE', 'TWO', 'THREE'].filter((y) => y !== whole[0])) {
+      assert.ok(!payload.text.includes(`${x}-MIDDLE`), `uploaded ${x} middle stays in the file`)
+    }
   } finally {
     await f.close()
   }

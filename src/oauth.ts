@@ -74,6 +74,8 @@ async function postJson(fetchImpl, url, body, headers = {}) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json', ...headers },
     body: JSON.stringify(body),
+    // sign-in must fail with a clear error, not hang on a dead endpoint
+    signal: AbortSignal.timeout(30_000),
   })
   const text = await res.text()
   if (!res.ok) throw new OAuthError(`HTTP ${res.status} from ${new URL(url).host}: ${text.slice(0, 300)}`, { status: res.status, kind: 'http' })

@@ -1,5 +1,10 @@
 // One turn's idle watchdog and abort translation.
 //
+// This timer is the LAST resort for model silence — Quick accepted the turn and
+// then sent nothing. It is not a bound for our own I/O: uploads, auth calls and
+// probes carry their own explicit timeouts and fallbacks (see attach.ts and
+// turn/attachments.ts), so a dead endpoint fails in seconds, not here.
+//
 // Every Quick event counts as progress except transport noise (keepalive/ping/
 // pong, ok-status pings, UI bookkeeping). Silence past idleMs aborts an
 // internal controller linked to the request signal, so socket.turn wakes even

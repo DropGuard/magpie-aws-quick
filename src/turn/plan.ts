@@ -207,12 +207,11 @@ export function buildTurnContext({ body, outpost, sessions, options, signal, sys
  * model keeps the useful ends and can read the middle from the file.
  * Returns the rewritten messages, or null when nothing could be uploaded.
  */
-async function swapBigToolResults(ctx: TurnContext, threadId: string, messages: any[], attachments: any[], opts: { startAt?: number; cap: number }): Promise<any[] | null> {
+async function swapBigToolResults(ctx: TurnContext, threadId: string, messages: any[], attachments: any[], opts: { startAt?: number } = {}): Promise<any[] | null> {
   const start = opts.startAt ?? 0
-  const floor = Math.max(TOOL_UPLOAD_MIN, opts.cap)
   const big = messages
     .map((m, i) => ({ m, i }))
-    .filter(({ m, i }) => i >= start && canonRole(m.role) === 'tool' && byteLen(textOf(m.content)) > floor)
+    .filter(({ m, i }) => i >= start && canonRole(m.role) === 'tool' && byteLen(textOf(m.content)) > TOOL_UPLOAD_MIN)
     .sort((a, b) => byteLen(textOf(b.m.content)) - byteLen(textOf(a.m.content)))
     .slice(0, 2)
   if (!big.length) return null
@@ -270,7 +269,7 @@ export async function composeAttempt(ctx: TurnContext, { threadId, reuse, retry 
     let local: RenderStats = {}
     let rendered = renderDelta(reuse.delta, { maxBytes: budget, stats: local })
     if (local.cut?.tool) {
-      const swapped = await swapBigToolResults(ctx, threadId, reuse.delta, attachments, { cap: Math.max(16 * 1024, budget - 2048) })
+      const swapped = await swapBigToolResults(ctx, threadId, reuse.delta, attachments)
       if (swapped) {
         local = {}
         rendered = renderDelta(swapped, { maxBytes: budget, stats: local })
@@ -289,8 +288,7 @@ export async function composeAttempt(ctx: TurnContext, { threadId, reuse, retry 
     if (!local.dropped && local.cut?.tool) {
       let lastAsst = -1
       for (let i = ctx.convo.length - 1; i >= 0; i--) if (canonRole(ctx.convo[i]?.role) === 'assistant') { lastAsst = i; break }
-      const cap = Math.max(16 * 1024, ctx.turnBudget - 2048)
-      const swapped = await swapBigToolResults(ctx, threadId, ctx.convo, attachments, { startAt: lastAsst + 1, cap })
+      const swapped = await swapBigToolResults(ctx, threadId, ctx.convo, attachments, { startAt: lastAsst + 1 })
       if (swapped) {
         local = {}
         rendered = renderTranscript(swapped, '', { maxBytes: ctx.turnBudget, stats: local })

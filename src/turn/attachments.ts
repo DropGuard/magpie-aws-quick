@@ -18,8 +18,11 @@ export const TOO_LONG_ERR = "context_length_exceeded: the conversation does not 
 // Text room kept free when inline images claim the frame.
 const IMAGE_TEXT_RESERVE = 8 * 1024
 /** A tool result above this size, when the frame had to cut it, is uploaded
- *  instead: the file keeps all of it and the frame points at the file. */
-export const TOOL_UPLOAD_MIN = 32 * 1024
+ *  instead: the file keeps all of it and the frame points at the file. 8 KB,
+ *  not 32: a single re-read costs a whole model turn (20-40 s), an upload ~1 s,
+ *  and medium results are exactly what gets water-filled when several share
+ *  the frame. */
+export const TOOL_UPLOAD_MIN = 8 * 1024
 const TOOL_UPLOADS_PER_TURN = 2
 
 /**
@@ -45,18 +48,6 @@ export interface AttachmentFlow {
   uploadToolResult: (tid: string, name: string, text: string) => Promise<any | null>
 }
 
-/** Bound a best-effort upload: an unresponsive endpoint must not hold the turn. */
-function withTimeout(signal: AbortSignal | undefined, ms: number): AbortSignal {
-  const ctl = new AbortController()
-  const timer = setTimeout(() => ctl.abort(), ms)
-  timer.unref?.()
-  if (signal) {
-    if (signal.aborted) ctl.abort()
-    else signal.addEventListener('abort', () => ctl.abort(), { once: true })
-  }
-  return ctl.signal
-}
-
 export function createAttachmentFlow({ outpost, options, signal, convo, images }: {
   outpost: any
   options: any
@@ -78,6 +69,8 @@ export function createAttachmentFlow({ outpost, options, signal, convo, images }
       uploadImage({
         session: sess, image: img, name: img.name, threadId: tid, outpostId: devId || undefined,
         fetchImpl: options?.fetchImpl ?? globalThis.fetch, signal,
+        // best-effort: an image that cannot land is named, not waited on
+        timeoutMs: 30_000,
       })
     ))
     const entries: any[] = []
@@ -118,6 +111,9 @@ export function createAttachmentFlow({ outpost, options, signal, convo, images }
       outpostId: devId || undefined,
       fetchImpl: options?.fetchImpl ?? globalThis.fetch,
       signal,
+      // required for the turn to work: bounded, then fail loudly (the client
+      // compacts) rather than waiting for the idle watchdog
+      timeoutMs: Number(options?.contextUploadTimeoutMs) > 0 ? Number(options.contextUploadTimeoutMs) : 120_000,
     })
   }
   // Pointer text for a transcript replaced by `entry`: the most recent turns
@@ -140,11 +136,14 @@ export function createAttachmentFlow({ outpost, options, signal, convo, images }
         session: sess, name, mimeType: 'text/plain', bytes: Buffer.from(text, 'utf8'),
         threadId: tid, outpostId: devId || undefined,
         fetchImpl: options?.fetchImpl ?? globalThis.fetch,
+        signal,
         // best-effort: a dead endpoint falls back to the truncation, quickly
-        signal: withTimeout(signal, 20_000),
+        timeoutMs: Number(options?.toolUploadTimeoutMs) > 0 ? Number(options.toolUploadTimeoutMs) : 20_000,
       })
     } catch (e: any) {
-      if (signal?.aborted || e?.name === 'AbortError') throw e
+      // Only the caller's abort propagates; our own upload timeout aborts the
+      // composed signal without touching the caller's, and must fall back.
+      if (signal?.aborted) throw e
       options?.log?.(`[aws-quick] tool-result upload failed: ${String(e?.message ?? e).slice(0, 200)}`)
       return null
     }
