@@ -299,3 +299,23 @@ test('renderDelta gives the current turn head and tail, not just the head', () =
   assert.ok(out.includes('TASK-HEAD') && out.includes('TASK-TAIL'))
   assert.ok(byteLen(out) <= 60 * 1024)
 })
+
+test('renderTranscript reports dropped history (pinned drops included) and lossless keeps all of it', () => {
+  const messages = []
+  for (let i = 0; i < 12; i++) {
+    messages.push({ role: 'user', content: `Q${i}-` + 'q'.repeat(3000) })
+    messages.push({ role: 'assistant', content: `A${i}-` + 'a'.repeat(3000) })
+  }
+  messages.push({ role: 'user', content: 'FINAL-ASK' })
+  const stats = {}
+  const cut = renderTranscript(messages, 'sys', { maxBytes: 8000, stats })
+  assert.ok(stats.truncated)
+  assert.ok(stats.dropped > 0, 'dropped messages are reported even when the first block is pinned')
+  assert.ok(cut.includes('Q0-'), 'the opening task stays pinned')
+  assert.ok(!cut.includes('Q5-'), 'the middle is what goes')
+
+  const full = renderTranscript(messages, 'sys', { lossless: true })
+  for (let i = 0; i < 12; i++) assert.ok(full.includes(`Q${i}-`), `Q${i} survives lossless`)
+  assert.ok(full.endsWith('FINAL-ASK'))
+  assert.ok(byteLen(full) > byteLen(cut) * 2)
+})

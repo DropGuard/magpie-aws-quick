@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
-import { uploadImage } from '../lib/attach.mjs'
+import { uploadImage, uploadFile } from '../lib/attach.mjs'
 
 const PNG_B64 = Buffer.from('fake-png-bytes-12345').toString('base64')
 const RAW = Buffer.from(PNG_B64, 'base64')
@@ -173,4 +173,25 @@ test('uploadImage delivers with the caller-supplied device id as outpostId', asy
   await upload(fn, { outpostId: '11111111-2222-4333-8444-555555555555' })
   const ia = JSON.parse(calls.find((c) => c.url.includes('qbs-event')).init.body).eventBody.invokeAgent
   assert.equal(ia.outpostId, '11111111-2222-4333-8444-555555555555')
+})
+
+test('uploadFile carries a text payload as a file entry, not an image', async () => {
+  const { fn, calls } = stubFetch(happyRoutes())
+  const bytes = Buffer.from('[conversation]\nuser: hello\nassistant: hi\n', 'utf8')
+  const entry = await uploadFile({ session: SESSION, name: 'context_ab12cd34.txt', mimeType: 'text/plain', bytes, threadId: 'thread-1', fetchImpl: fn, pollMs: 0 })
+  assert.equal(entry.type, 'file')
+  assert.equal(entry.mimeType, 'text/plain')
+  assert.equal(entry.size, bytes.length)
+  const up = calls.find((c) => c.url.includes('upload-attachment'))
+  assert.match(up.url, /contentType=text%2Fplain/)
+  assert.match(up.url, new RegExp(`contentLength=${bytes.length}`))
+  assert.equal(up.init.body.length, bytes.length)
+})
+
+test('uploadFile refuses an empty payload instead of uploading it', async () => {
+  const { fn } = stubFetch(happyRoutes())
+  await assert.rejects(
+    uploadFile({ session: SESSION, name: 'context_empty.txt', mimeType: 'text/plain', bytes: new Uint8Array(), threadId: 't', fetchImpl: fn, pollMs: 0 }),
+    (e) => e.reason === 'upload' && /empty/.test(e.message),
+  )
 })

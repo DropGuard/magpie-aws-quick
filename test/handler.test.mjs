@@ -32,9 +32,36 @@ function req(body, extra = {}) {
     body,
     outpostMgr,
     sessions: extra.sessions,
-    options: { identity: 'test-acct', log: () => {} },
+    options: { identity: 'test-acct', log: () => {}, ...(extra.options || {}) },
     signal: extra.signal,
   })
+}
+
+const j = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { 'content-type': 'application/json' } })
+
+/** Stub fetch for the cloud attachment flow; `over` overrides single routes. */
+function attachFetch(over = {}) {
+  const calls = []
+  const fn = async (url, init = {}) => {
+    const u = String(url)
+    calls.push({ url: u, init })
+    if (u.includes('upload-attachment')) return over.upload ?? j({ attachmentId: 'att-ctx' })
+    if (u.includes('attachment-dlp-status')) return j({ dlpJobStatus: 'COMPLETED', policyAction: 'ALLOW' })
+    if (u.includes('qbs-event')) return j({ eventResponse: { invokeAgentResponse: { api_response: { status: 200, body: { path: '/data/s3files/u/sessions/t/workspace/attached_files/context.txt' } } } } })
+    return j({ error: `unexpected ${u}` }, 404)
+  }
+  return { fn, calls }
+}
+
+/** A conversation far past one 64 KB frame: 40 × 4 KB turns. */
+function oversizedConvo() {
+  const messages = []
+  for (let i = 0; i < 20; i++) {
+    messages.push({ role: 'user', content: `QUESTION-${i}-` + 'q'.repeat(4000) })
+    messages.push({ role: 'assistant', content: `ANSWER-${i}-` + 'a'.repeat(4000) })
+  }
+  messages.push({ role: 'user', content: 'FINAL-ASK: what should I do next?' })
+  return messages
 }
 
 async function readSse(res) {
@@ -593,8 +620,6 @@ test('usage carries Quick cost, context window and resolved model', async () => 
 })
 
 // ---------- cloud image upload (direct backends) ----------
-
-const j = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { 'content-type': 'application/json' } })
 
 /** fetchImpl stub for the three upload endpoints; records calls. */
 function uploadFetch(calls, { failUpload = false } = {}) {
@@ -1369,4 +1394,57 @@ test('session-key fallback does not splice one subagent\'s tool results into a s
   await r.json()
   const [tB, tA2] = [fake.state.userMessages[before - 1], fake.state.userMessages[before]]
   assert.notEqual(tA2.threadId, tB.threadId, 'must not resume the sibling thread')
+})
+
+test('a fresh thread too large for one frame sends the conversation as an attachment', async () => {
+  const { fn, calls } = attachFetch()
+  const res = await req(
+    { model: 'smart', stream: true, messages: oversizedConvo() },
+    { options: { fetchImpl: fn } },
+  )
+  assert.equal(res.status, 200)
+  const payload = fake.state.userMessages.at(-1).payload
+  // The frame keeps a pointer + the current question, not a gutted transcript.
+  assert.match(payload.text, /is in the attached file context_[0-9a-f]{8}\.txt/)
+  assert.ok(payload.text.includes('FINAL-ASK'), 'the current turn rides along')
+  assert.ok(!payload.text.includes('QUESTION-0-'), 'old turns are not crammed back into the frame')
+  // The whole conversation, but no per-block caps, went up as one text file.
+  const up = payload.attachments.find((a) => a.type === 'file')
+  assert.ok(up, 'a file attachment is declared')
+  assert.equal(up.mimeType, 'text/plain')
+  assert.ok(up.size > 150 * 1024, `attachment holds the full transcript (${up.size})`)
+  const upCall = calls.find((c) => c.url.includes('upload-attachment'))
+  assert.match(upCall.url, /contentType=text%2Fplain/)
+  // The transcript is delivered into the thread the turn runs on.
+  const threadId = fake.state.userMessages.at(-1).threadId
+  const deliver = JSON.parse(calls.find((c) => c.url.includes('qbs-event')).init.body).eventBody.invokeAgent
+  assert.equal(deliver.path, `files/upload/${threadId}`)
+  // And the user is told what happened instead of watching the model forget.
+  const events = await readSse(res)
+  assert.ok(events.some((e) => String(e.choices?.[0]?.delta?.content ?? '').includes('附件')), 'the note reaches the client')
+})
+
+test('when the context attachment fails the turn fails loudly so the client compacts', async () => {
+  const { fn } = attachFetch({ upload: j({ error: 'boom' }, 500) })
+  const res = await req(
+    { model: 'smart', messages: oversizedConvo() },
+    { options: { fetchImpl: fn } },
+  )
+  assert.equal(res.status, 400)
+  const body = await res.json()
+  assert.equal(body.error.type, 'invalid_request_error')
+  assert.match(body.error.message, /context_length_exceeded/)
+  assert.match(body.error.message, /64 ?KB/)
+})
+
+test('contextAttachments:false uploads nothing and fails loudly instead of cutting silently', async () => {
+  const { fn, calls } = attachFetch()
+  const res = await req(
+    { model: 'smart', messages: oversizedConvo() },
+    { options: { fetchImpl: fn, contextAttachments: false } },
+  )
+  assert.equal(calls.length, 0, 'no upload is attempted')
+  assert.equal(res.status, 400, 'a silent cut is never the fallback')
+  const body = await res.json()
+  assert.match(body.error.message, /context_length_exceeded/)
 })

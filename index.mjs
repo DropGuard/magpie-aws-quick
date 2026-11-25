@@ -39,6 +39,7 @@
  *   idleTimeoutMs abort a turn with no Quick progress for this long (default 300000; 0 = off); keepalives don't count
  *   showQuickTools surface Quick's own tool_start events as [Quick: name] reasoning lines (default true)
  *   stableDeviceId direct sessions send a stable per-account device id as outpostId, like the desktop (default true; false = empty)
+ *   contextAttachments  a fresh thread's transcript that cannot fit one 64 KB frame is uploaded as a text attachment the model reads (default true; false = fail that turn with 400 so the client compacts its own history)
  *   log          function(line) for plugin diagnostics
  *
  * Models are Quick's agent modes, not raw model ids:

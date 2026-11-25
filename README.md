@@ -286,9 +286,15 @@ browser or in a private/incognito window, without signing out of the others.
   apply.
 - **Message size**: the whole `user_message` frame is hard-capped at 64 KB
   server-side (text, instructions and attachments share it). Oversized system prompts /
-  tool schemas / history are compacted automatically (schema de-annotation,
-  tool-spec lite then names-only fallback, oldest-first history trimming,
-  capped tool results). Ordinary chat keeps full system instructions when they fit alongside the
+  tool schemas are compacted automatically (schema de-annotation, tool-spec
+  lite then names-only fallback, capped tool results). A fresh thread whose
+  whole transcript cannot fit one frame does not lose its middle: the transcript
+  goes up as a `context_*.txt` attachment through Quick's own upload flow and the
+  message only points at it, so the model reads the full history with its file
+  tool. If the upload fails too, the request errors with 400
+  `context_length_exceeded` so the client compacts its own history instead of
+  working from a silently gutted transcript (`contextAttachments:false` disables
+  the upload and keeps the loud 400). Ordinary chat keeps full system instructions when they fit alongside the
   encoded turn. Claude Code Auto permission reviews keep the complete policy:
   a policy too large for one frame is primed verbatim into a dedicated Quick
   thread (cached per policy, rotated periodically), so the classifier still

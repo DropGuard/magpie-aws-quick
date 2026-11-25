@@ -230,8 +230,12 @@ magpie login aws-quick              # 按提示选择登录方式
 - **多窗口/并发**：同一 QuickSocket 上不同 thread 可并行 turn；同一 thread 的并发请求会被拒绝（`busy`）。
 - **消息体积**：整个 `user_message` 帧服务端上限 64KB（`text` 与
   指令及附件共享）。超大 system prompt / 工具 schema / 会话历史会自动
-  压缩（schema 去注解、工具规格 lite→仅名字降级、历史从旧到新裁、
-  tool_result 封顶），
+  压缩（schema 去注解、工具规格 lite→仅名字降级、tool_result 封顶）。整段对话装不进
+  一帧时，插件把它上传成 `context_*.txt` 附件（走 Quick 自己的附件流程），帧里只留
+  "读附件再继续" 的说明和最新一条消息——模型用文件工具读全文，不会丢历史。
+  附件也传不上去时，请求以 400 `context_length_exceeded` 失败，让客户端压缩自己的
+  历史，而不是静默截断（静默截断会让模型反复重读、忘记任务）。设
+  `contextAttachments:false` 可关闭这一行为（同样保留响亮的 400）。
   普通对话的系统指令与本轮消息编码后若能放进同一帧，就会完整发送。
   Claude Code 的 Auto 权限审核会保留完整策略：策略超过单帧上限时，会原样预热进
   一个专用 Quick 线程（按策略哈希缓存、定期轮换），分类器仍能看到每一条规则；
