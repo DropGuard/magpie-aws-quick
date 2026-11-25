@@ -1501,3 +1501,71 @@ test('a big caller system prompt is not clipped when the frame has room (escaped
   const said = events.map((e) => String(e.choices?.[0]?.delta?.content ?? '')).join('')
   assert.ok(!said.includes('系统指令过长'), `no system clip note: ${said}`)
 })
+
+test('a guardrail stop is retried automatically before the client sees it', async () => {
+  let turn = 0
+  const f = await startFakeQuick({
+    script: (payload) => {
+      turn++
+      if (turn === 1) return [{ type: 'guardrail_blocked', payload: { message: "That content did not pass our automated check. Try asking again - a small rephrase usually helps." } }]
+      return [
+        { type: 'text_delta', payload: { delta: 'retried-ok' } },
+        { type: 'turn_usage', payload: { input_tokens: 10, output_tokens: 3 } },
+        { type: 'message_complete', payload: { text: 'retried-ok', continuation_expected: false } },
+      ]
+    },
+  })
+  try {
+    const res = await handleChatCompletions({
+      body: { model: 'fast', stream: true, messages: [{ role: 'user', content: 'do the thing' }] },
+      outpostMgr: fakeMgr(f),
+      options: { identity: 'guard-retry', log: () => {} },
+    })
+    assert.equal(res.status, 200)
+    const events = await readSse(res)
+    const said = events.map((e) => String(e.choices?.[0]?.delta?.content ?? '')).join('')
+    assert.ok(said.includes('retried-ok'), `the retried answer is what the client gets: ${said}`)
+    assert.ok(!said.includes('did not pass'), 'the canned sentence never reaches the client')
+    assert.match(said, /自动重试/)
+    const sent = f.state.userMessages.map((m) => m.payload.text)
+    assert.equal(sent.length, 2, 'one retry on the same thread')
+    assert.match(sent[1], /Continue the previous request/)
+  } finally {
+    await f.close()
+  }
+})
+
+test('guardrail retries are bounded, then labelled and surfaced as an error', async () => {
+  const f = await startFakeQuick({
+    script: () => [{ type: 'guardrail_blocked', payload: { message: 'The model\'s content filter stopped this reply. Rephrase, or start a new chat.' } }],
+  })
+  try {
+    const res = await handleChatCompletions({
+      body: { model: 'fast', messages: [{ role: 'user', content: 'blocked forever' }] },
+      outpostMgr: fakeMgr(f),
+      options: { identity: 'guard-exhaust', guardrailRetries: 1, log: () => {} },
+    })
+    assert.equal(res.status, 502)
+    const body = await res.json()
+    assert.match(body.error.message, /\[Quick 审核拦截\]/)
+    assert.match(body.error.message, /content filter stopped/)
+    assert.equal(f.state.userMessages.length, 2, 'original attempt + one retry, then stop')
+  } finally {
+    await f.close()
+  }
+})
+
+test('guardrailRetries:0 keeps the old behaviour (no extra turn)', async () => {
+  const f = await startFakeQuick({ script: () => [{ type: 'guardrail_blocked', payload: { message: 'That content did not pass our automated check.' } }] })
+  try {
+    const res = await handleChatCompletions({
+      body: { model: 'fast', messages: [{ role: 'user', content: 'x' }] },
+      outpostMgr: fakeMgr(f),
+      options: { identity: 'guard-off', guardrailRetries: 0, log: () => {} },
+    })
+    assert.equal(res.status, 502)
+    assert.equal(f.state.userMessages.length, 1)
+  } finally {
+    await f.close()
+  }
+})

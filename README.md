@@ -221,6 +221,7 @@ A few plugin options tune request handling (`magpie plugin options aws-quick '{â
 - `stableDeviceId` (default `true`): direct sessions send a stable
   per-account device id as `outpostId` (see Device ids above); `false` sends
   an empty value.
+- `guardrailRetries` (default `1`): when Quick's server-side content check stops a turn (a canned sentence with usage 0/0), the plugin retries it on the same thread before the client ever sees the block; `0` disables, surfacing the block.
 
 ## FAQ
 

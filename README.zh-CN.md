@@ -187,6 +187,7 @@ magpie login aws-quick              # 按提示选择登录方式
   `false` 隐藏。
 - `stableDeviceId`（默认 `true`）：直连会话把按账号固定的设备 ID 作为
   `outpostId` 发送（见上文"设备 ID"）；`false` 改发空值。
+- `guardrailRetries`（默认 `1`）：一轮被 Quick 服务端审核拦下（回复里只有一句固定文案、usage 为 0）时，插件在客户端看到之前自动在同一 thread 上重试几次；`0` 关闭，直接把拦截交给客户端。
 
 ## 常见问题
 

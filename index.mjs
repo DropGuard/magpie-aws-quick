@@ -40,6 +40,7 @@
  *   showQuickTools surface Quick's own tool_start events as [Quick: name] reasoning lines (default true)
  *   stableDeviceId direct sessions send a stable per-account device id as outpostId, like the desktop (default true; false = empty)
  *   contextAttachments  a fresh thread's transcript that cannot fit one 64 KB frame is uploaded as a text attachment the model reads (default true; false = fail that turn with 400 so the client compacts its own history)
+ *   guardrailRetries  how many times a turn stopped by Quick's server-side content check is retried before the client sees it (default 1; 0 = surface the block immediately)
  *   log          function(line) for plugin diagnostics
  *
  * Models are Quick's agent modes, not raw model ids:
