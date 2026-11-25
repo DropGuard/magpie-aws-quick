@@ -110,7 +110,10 @@ test('invariant: injected instructions are never squeezed, only the spec degrade
   const { payload, said } = await run({ model: 'fast', messages, tools: tools(14) })
   assert.ok(payload.text.includes('RULES-HEAD') && payload.text.includes('RULES-TAIL'))
   assert.ok(!/middle omitted[\s\S]{0,40}RULES/.test(payload.text), 'no squeeze marker inside the rules block')
-  assert.match(said, /工具说明过长，已降级为精简版/, 'the concession is stated')
+  assert.match(said, /工具说明过长/, 'the concession is stated')
+  // Graduated compression: descriptions give way first, parameter schemas stay.
+  assert.ok(payload.text.includes('"required"') || payload.text.includes('"path"'), 'schemas survive the description trim')
+  assert.ok(!said.includes('已省略参数结构'), 'schemas were not dropped in this case')
 })
 
 test('invariant: history that cannot fit arrives as an attachment, not as drops', async () => {

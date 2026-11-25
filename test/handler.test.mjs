@@ -1597,5 +1597,5 @@ test('the current turn\'s injected instructions arrive whole; the tool spec give
   assert.ok(payload.text.includes('Do the thing.'))
   const events = await readSse(res)
   const said = events.map((e) => String(e.choices?.[0]?.delta?.content ?? '')).join('')
-  assert.match(said, /工具说明过长，已降级为精简版/)
+  assert.match(said, /工具说明过长/)
 })
