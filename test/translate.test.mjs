@@ -319,3 +319,27 @@ test('renderTranscript reports dropped history (pinned drops included) and lossl
   assert.ok(full.endsWith('FINAL-ASK'))
   assert.ok(byteLen(full) > byteLen(cut) * 2)
 })
+
+test('one big tool result uses the whole frame instead of the fixed 16 KB cap', () => {
+  const big = 'Z'.repeat(40 * 1024)
+  const delta = [
+    { role: 'tool', tool_call_id: 'c1', name: 'read', content: big },
+    { role: 'user', content: 'next' },
+  ]
+  const stats = {}
+  const out = renderDelta(delta, { maxBytes: 60 * 1024, stats })
+  assert.ok(!out.includes('middle omitted'), 'no needless cut when the frame has room')
+  assert.ok(out.includes(big), 'the result arrives whole')
+  assert.ok(!stats.truncated)
+})
+
+test('parallel big tool results still share one frame (water-filling unchanged)', () => {
+  const stats = {}
+  const out = renderDelta([
+    { role: 'tool', tool_call_id: 'a', name: 'read', content: 'A'.repeat(40 * 1024) },
+    { role: 'tool', tool_call_id: 'b', name: 'read', content: 'B'.repeat(40 * 1024) },
+  ], { maxBytes: 60 * 1024, stats })
+  assert.ok(stats.truncated)
+  assert.ok(out.includes('middle omitted'))
+  assert.ok(byteLen(out) <= 60 * 1024 + 512)
+})

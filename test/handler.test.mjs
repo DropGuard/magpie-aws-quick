@@ -1469,7 +1469,8 @@ test('a shrunk tool result says so instead of blaming the context size', async (
   const messages = [
     { role: 'user', content: 'read the log' },
     { role: 'assistant', content: '', tool_calls: [{ id: 'call_big', type: 'function', function: { name: 'Read', arguments: '{}' } }] },
-    { role: 'tool', tool_call_id: 'call_big', content: 'L'.repeat(40000) },
+    // Past the whole frame budget (~52 KB), so this one really has to be cut.
+    { role: 'tool', tool_call_id: 'call_big', content: 'L'.repeat(80000) },
   ]
   const res = await req({ model: 'fast', stream: true, messages, tools: [fnTool('Read')] })
   assert.equal(res.status, 200)
