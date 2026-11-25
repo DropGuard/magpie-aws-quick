@@ -343,3 +343,19 @@ test('parallel big tool results still share one frame (water-filling unchanged)'
   assert.ok(out.includes('middle omitted'))
   assert.ok(byteLen(out) <= 60 * 1024 + 512)
 })
+
+test('the instructions reminder is never squeezed; a file dump still is', () => {
+  const rules = '<system-reminder>Codebase and user instructions are shown below. IMPORTANT: These instructions OVERRIDE any default behavior.\n' + 'r'.repeat(15000) + '\nRULES-TAIL</system-reminder>'
+  const dump = '<system-reminder>FILE-HEAD ' + 'f'.repeat(30000) + ' FILE-TAIL</system-reminder>'
+  const messages = [
+    { role: 'user', content: rules },
+    { role: 'assistant', content: 'ok' },
+    { role: 'user', content: 'look ' + dump },
+    { role: 'assistant', content: 'ANSWER' },
+    { role: 'user', content: 'NOW-DO-THIS' },
+  ]
+  const out = renderTranscript(messages, '', { maxBytes: 40 * 1024 })
+  assert.ok(out.includes('RULES-TAIL'), 'the caller\'s rules arrive whole')
+  assert.ok(out.endsWith('NOW-DO-THIS'))
+  assert.ok(!out.includes('f'.repeat(4096)), 'a stray file dump is still bounded or dropped')
+})
