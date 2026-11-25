@@ -18,11 +18,16 @@ export const TOOLS_STILL_APPLY = 'When the user asks you to make or change somet
 export const INVALID_CALL_TOOL = 'aws_quick_invalid_tool_call'
 
 /**
- * What to tell the client about this turn's trimming, by reason. A squeezed
- * <system-reminder> alone stays silent: Claude Code sends the same content as
- * the system prompt, so it is hygiene, not a loss — and the old blanket
- * "context over 64KB" line sent people hunting for a size problem that was
- * not there.
+ * What to tell the client about this turn's trimming, by reason.
+ *
+ * Silent by policy:
+ *   - a squeezed <system-reminder>: Claude Code sends the same content as the
+ *     system prompt, so it is hygiene, not a loss;
+ *   - description-only tool caps (desc1200/600/300/120): schemas are intact,
+ *     so tool arguments stay correct, and the cap hits every fresh session's
+ *     first frame — a line per session nobody can act on reads as failure.
+ * Still named: schema-dropping tiers (lite/names), history/attachment moves,
+ * tool-result head+tail, a capped current message and a capped frame.
  */
 export function cutNote(stats: RenderStats | null | undefined, clippedSystem: boolean) {
   const cut = stats?.cut || {}
@@ -30,11 +35,10 @@ export function cutNote(stats: RenderStats | null | undefined, clippedSystem: bo
   if (cut.system || clippedSystem) parts.push('调用方的系统指令过长，已截短（规则可能不完整）')
   if (cut.preamble) {
     const tier = stats?.specTier || ''
-    parts.push(tier === 'lite'
-      ? '工具说明过长，已省略参数结构、只留名称与描述（参数需按用途推断）'
-      : tier === 'names'
-        ? '工具说明过长，已只保留工具名'
-        : '工具说明过长，已缩短各工具的描述（参数结构保留）')
+    if (tier === 'lite') parts.push('工具说明过长，已省略参数结构、只留名称与描述（参数需按用途推断）')
+    else if (tier === 'names') parts.push('工具说明过长，已只保留工具名')
+    else if (!tier) parts.push('工具说明过长，已缩短各工具的描述（参数结构保留）')
+    // desc* tiers: schemas kept, only long prose trimmed — stay silent
   }
   if (cut.history) parts.push(`有 ${cut.history} 条较早消息装不进一帧，已丢弃`)
   if (cut.tool) parts.push(`${cut.tool} 处工具结果过大，已保留头尾、省略中间（需要更多内容就在原工具上缩小范围重跑）`)

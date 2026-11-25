@@ -26,7 +26,7 @@ import { errorResponse, errorType, httpStatus, makeId, respondWithItems } from '
 import { primeItems } from './http/pump.ts'
 import { nextRetry } from './runtime/retry.ts'
 import {
-  AGENT_MODES, MODELS, modeFor, effortFor, textOf,
+  AGENT_MODES, MODELS, modeFor, effortFor, textOf, byteLen,
 } from './translate.ts'
 
 const SURFACE = 'QUICK_WORK_DESKTOP_WINDOWS'
@@ -231,7 +231,16 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
         const action = nextRetry({ guardTries, guardMax, reused: !!(reuse && sessions), produced: produced() }, e)
         if (action.type === 'guardrail-retry') {
           guardTries++
-          payload.text = GUARDRAIL_RETRY_NUDGE
+          // Keep what the model was asked to answer. On a fresh thread
+          // payload.text is the whole transcript; on a reused thread it is
+          // this turn's delta (tool results included). Replacing it with the
+          // nudge left the model with nothing but "the last attempt was
+          // stopped" — it then told the user the earlier request never
+          // arrived. Append instead; if the frame cannot hold the extra
+          // bytes, the unchanged text is itself a valid retry.
+          const original = String(payload.text ?? '')
+          const nudged = `${original}\n\n${GUARDRAIL_RETRY_NUDGE}`
+          payload.text = byteLen(nudged) <= ctx.frameCap ? nudged : original
           payload.message_id = crypto.randomUUID()
           watchdog.bump()
           options?.log?.(`[aws-quick] guardrail blocked the turn; retrying (${guardTries}/${guardMax})`)

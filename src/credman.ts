@@ -135,8 +135,9 @@ export function credManDeviceId({ dir = defaultStoreDir(), home }: { dir?: strin
     if (isDeviceId(db[k])) return db[k]
     db[k] = randomUUID()
     mkdirSync(dir, { recursive: true })
-    writeFileSync(`${file}.tmp`, JSON.stringify(db, null, 2) + '\n')
-    renameSync(`${file}.tmp`, file)
+    const tmp = `${file}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`
+    writeFileSync(tmp, JSON.stringify(db, null, 2) + '\n')
+    renameSync(tmp, file)
     return db[k]
   }
 }

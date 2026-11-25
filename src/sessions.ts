@@ -14,7 +14,7 @@
 // entry) starts a fresh thread. Entries are claimed when used so a retry never
 // replays a turn. Memory only.
 import { createHash } from 'node:crypto'
-import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, renameSync, statSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { textOf, canonRole } from './translate.ts'
 
@@ -103,53 +103,109 @@ export function createSessionStore({ ttlMs = SESSION_DEFAULTS.ttlMs, max = SESSI
       }
     } catch { /* missing/corrupt → start empty */ }
   }
-  let saveTimer: any = null
+  // Another instance may have written since we loaded (the host can
+  // re-instantiate per request, and a long-lived instance would otherwise
+  // never see those anchors). On a lookup MISS, re-read the file once.
+  let lastStamp: string | null = null
+  const stamp = () => {
+    try { const st = statSync(file as string); return `${st.mtimeMs}:${st.size}` } catch { return null }
+  }
+  lastStamp = stamp()
+  const refresh = () => {
+    if (!file) return
+    const st = stamp()
+    if (!st || st === lastStamp) return
+    try {
+      const db = JSON.parse(readFileSync(file, 'utf8'))
+      const saved = (db?.entries ?? {}) as Record<string, any>
+      for (const [k, v] of Object.entries(saved)) {
+        if (!v || typeof v.threadId !== 'string' || !Number.isFinite(v.at)) continue
+        if (now() - v.at > ttlMs) continue
+        const cur = map.get(k)
+        if (cur && cur.at >= v.at) continue
+        const toolNames = Array.isArray(v.toolNames) ? v.toolNames.filter((n) => typeof n === 'string') : undefined
+        map.set(k, { entry: { threadId: v.threadId, replyKey: v.replyKey, tailKey: v.tailKey, toolNames, callIds: Array.isArray(v.callIds) ? v.callIds : undefined }, at: v.at })
+      }
+    } catch { /* missing/corrupt → keep memory */ }
+    lastStamp = st
+  }
+
+  // Keys this instance has written or deleted since loading. A plugin host may
+  // re-instantiate the store per request, so several instances share the file;
+  // a full-map rewrite from a stale instance used to clobber the entries a
+  // faster turn had just written (measured: 4 of 5 tool-loop turns lost their
+  // anchor, so the next user message started a new thread). Persist is
+  // therefore write-through and merges only OUR keys into whatever is on disk.
+  const touched = new Set<string>()
   const persist = () => {
     if (!file) return
-    clearTimeout(saveTimer)
-    saveTimer = setTimeout(() => {
+    try {
+      mkdirSync(dirname(file), { recursive: true })
+      let disk: Record<string, any> = {}
       try {
-        mkdirSync(dirname(file), { recursive: true })
-        const entries = {}
-        for (const [k, v] of map) entries[k] = { threadId: v.entry.threadId, at: v.at, replyKey: v.entry.replyKey, tailKey: v.entry.tailKey, toolNames: v.entry.toolNames, callIds: v.entry.callIds }
-        const tmp = `${file}.tmp`
-        writeFileSync(tmp, JSON.stringify({ entries }))
-        renameSync(tmp, file)
-      } catch { /* best effort — cache is an optimization */ }
-    }, 200)
-    saveTimer.unref?.()
+        const db = JSON.parse(readFileSync(file, 'utf8'))
+        if (db && typeof db === 'object' && db.entries && typeof db.entries === 'object') disk = db.entries
+      } catch { /* missing/corrupt → start from empty */ }
+      const entries: Record<string, any> = { ...disk }
+      for (const k of touched) {
+        const v = map.get(k)
+        if (v) entries[k] = { threadId: v.entry.threadId, at: v.at, replyKey: v.entry.replyKey, tailKey: v.entry.tailKey, toolNames: v.entry.toolNames, callIds: v.entry.callIds }
+        else delete entries[k]
+      }
+      // Unique tmp name: two plugin instances (a chat turn and a background
+      // request) share this file, and a shared tmp path loses one of the two
+      // writes on rename.
+      const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`
+      writeFileSync(tmp, JSON.stringify({ entries }))
+      renameSync(tmp, file)
+      touched.clear()
+      lastStamp = stamp()
+    } catch { /* best effort — cache is an optimization */ }
   }
   const live = (key) => {
     const v = map.get(key)
     if (!v) return undefined
-    if (now() - v.at > ttlMs) { map.delete(key); return undefined }
+    if (now() - v.at > ttlMs) { map.delete(key); touched.add(key); return undefined }
     return v
   }
+  const findEntryIn = (pred) => {
+    for (const [key, v] of map) {
+      if (now() - v.at > ttlMs) { map.delete(key); touched.add(key); continue }
+      if (pred(v.entry)) return { key, entry: v.entry }
+    }
+    return undefined
+  }
   return {
-    has: (key) => !!live(key),
+    has(key) {
+      if (live(key)) return true
+      refresh()
+      return !!live(key)
+    },
     /** First live entry matching pred → {key, entry}; does not remove it. */
     findEntry(pred) {
-      for (const [key, v] of map) {
-        if (now() - v.at > ttlMs) { map.delete(key); continue }
-        if (pred(v.entry)) return { key, entry: v.entry }
-      }
-      return undefined
+      const hit = findEntryIn(pred)
+      if (hit) return hit
+      refresh()
+      return findEntryIn(pred)
     },
     take(key) {
-      const v = live(key)
+      let v = live(key)
+      if (!v) { refresh(); v = live(key) }
       if (!v) return undefined
       map.delete(key)
+      touched.add(key)
       persist()
       return v.entry
     },
     set(key, entry) {
       map.delete(key)
       map.set(key, { entry, at: now() })
-      while (map.size > max) map.delete(map.keys().next().value)
+      touched.add(key)
+      while (map.size > max) { const oldest = map.keys().next().value; map.delete(oldest); touched.add(oldest) }
       persist()
     },
     get size() { return map.size },
-    clear() { map.clear(); persist() },
+    clear() { for (const k of map.keys()) touched.add(k); map.clear(); persist() },
   }
 }
 

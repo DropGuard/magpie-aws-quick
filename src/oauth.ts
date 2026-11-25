@@ -186,7 +186,8 @@ export function createSessionStore({ dir }: { dir?: string } = {}) {
   }
   const write = (db) => {
     mkdirSync(d, { recursive: true })
-    const tmp = `${file}.tmp`
+    // unique tmp: a login/refresh can race another instance's write
+    const tmp = `${file}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`
     writeFileSync(tmp, JSON.stringify(db, null, 2) + '\n')
     try { chmodSync(tmp, 0o600) } catch {}
     renameSync(tmp, file)
@@ -229,7 +230,7 @@ export function rememberDiscovery(dir, discovery) {
   const file = path.join(d, DISCOVERY_FILE)
   const data = { saved_at: Date.now() }
   for (const k of DISCOVERY_FIELDS) data[k] = String(discovery?.[k] ?? '')
-  const tmp = `${file}.tmp`
+  const tmp = `${file}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`
   writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n')
   try { chmodSync(tmp, 0o600) } catch {}
   renameSync(tmp, file)

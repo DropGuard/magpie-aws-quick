@@ -98,12 +98,20 @@ export function pickPreamble(input: {
 }): { preamble: string; tier: PreambleTier; concession?: ConcessionCode } {
   const { tools, toolChoice, room, need = 0 } = input
   if (!tools.length) return { preamble: '', tier: 'full' }
+  // buildToolPreamble drops parameter schemas on its own when a spec exceeds
+  // PREAMBLE_CAP (40 KB). That is the 'lite' tier's loss, so report it as one:
+  // otherwise pickPreamble sees a small 'full' string and no note is shown
+  // for a silent schema drop.
+  const liteProbe = buildToolPreamble(tools, toolChoice, { lite: true })
+  const effectiveTier = (tier: PreambleTier, preamble: string): PreambleTier =>
+    ((tier === 'full' || tier.startsWith('desc')) && preamble === liteProbe ? 'lite' : tier)
   let best: { preamble: string; tier: PreambleTier } | null = null
   for (const { tier, opts } of TIERS) {
     const preamble = buildToolPreamble(tools, toolChoice, opts)
-    if (!best || byteLen(preamble) < byteLen(best.preamble)) best = { preamble, tier }
+    const effective = effectiveTier(tier, preamble)
+    if (!best || byteLen(preamble) < byteLen(best.preamble)) best = { preamble, tier: effective }
     if (byteLen(preamble) <= room - need - 512) {
-      return tier === 'full' ? { preamble, tier } : { preamble, tier, concession: TIER_CONCESSION[tier] }
+      return effective === 'full' ? { preamble, tier: effective } : { preamble, tier: effective, concession: TIER_CONCESSION[effective as Exclude<PreambleTier, 'full'>] }
     }
   }
   const fallback = best ?? { preamble: '', tier: 'full' as PreambleTier }

@@ -110,10 +110,33 @@ test('invariant: injected instructions are never squeezed, only the spec degrade
   const { payload, said } = await run({ model: 'fast', messages, tools: tools(14) })
   assert.ok(payload.text.includes('RULES-HEAD') && payload.text.includes('RULES-TAIL'))
   assert.ok(!/middle omitted[\s\S]{0,40}RULES/.test(payload.text), 'no squeeze marker inside the rules block')
-  assert.match(said, /工具说明过长/, 'the concession is stated')
   // Graduated compression: descriptions give way first, parameter schemas stay.
   assert.ok(payload.text.includes('"required"') || payload.text.includes('"path"'), 'schemas survive the description trim')
-  assert.ok(!said.includes('已省略参数结构'), 'schemas were not dropped in this case')
+  // Description-only caps are silent by policy (schema intact, hits every
+  // fresh session's first frame); dropping schemas is what must be stated.
+  assert.ok(!said.includes('工具说明过长') && !said.includes('单帧上限'), `a description-only cap is silent: ${said}`)
+})
+
+test('invariant: dropping parameter schemas is named', async () => {
+  // Schemas big enough that even the 40 KB preamble cap cannot hold the full
+  // spec: the builder falls back to names+descriptions, and that loss (schemas
+  // gone) has to reach the client.
+  const huge = Array.from({ length: 14 }, (_, i) => ({
+    type: 'function',
+    function: {
+      name: `Huge${i}`,
+      description: `Does the ${i}th thing. ` + 'd'.repeat(1500),
+      parameters: { type: 'object', properties: { path: { type: 'string', enum: Array.from({ length: 8 }, () => 'e'.repeat(250)) } }, required: ['path'] },
+    },
+  }))
+  const messages = [
+    { role: 'system', content: system(20000) },
+    { role: 'user', content: reminder('RULES', 16000) + '\n\nDo it.' },
+  ]
+  const { payload, said } = await run({ model: 'fast', messages, tools: huge })
+  assert.ok(payload.text.includes('RULES-HEAD') && payload.text.includes('RULES-TAIL'))
+  assert.match(said, /已省略参数结构/, 'the schema drop is stated')
+  assert.ok(!payload.text.includes('"required"'), 'schemas are gone in this frame')
 })
 
 test('invariant: history that cannot fit arrives as an attachment, not as drops', async () => {
@@ -134,6 +157,13 @@ test('invariant: history that cannot fit arrives as an attachment, not as drops'
 test('invariant: every cut the client can see is named by cutNote', () => {
   assert.match(cutNote({ cut: { tool: 1 } }, false), /工具结果过大/)
   assert.match(cutNote({ cut: { preamble: 1 } }, false), /工具说明过长/)
+  // description-only caps keep the schema and hit every fresh session, so they
+  // are deliberately silent; schema-dropping tiers must still be named.
+  for (const tier of ['desc1200', 'desc600', 'desc300', 'desc120']) {
+    assert.equal(cutNote({ cut: { preamble: 1 }, specTier: tier }, false), '', `${tier} is silent`)
+  }
+  assert.match(cutNote({ cut: { preamble: 1 }, specTier: 'lite' }, false), /省略参数结构/)
+  assert.match(cutNote({ cut: { preamble: 1 }, specTier: 'names' }, false), /只保留工具名/)
   assert.match(cutNote({ cut: { turn: 1 } }, false), /当前消息过长/)
   assert.match(cutNote({ cut: { history: 2 } }, false), /2 条较早消息/)
   assert.match(cutNote({ cut: { system: 1 } }, false), /系统指令过长/)

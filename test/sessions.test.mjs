@@ -109,15 +109,73 @@ test('store persists to disk and a fresh instance resumes entries', async () => 
     const s1 = createSessionStore({ file, ttlMs: 60_000 })
     s1.set('k1', { threadId: 'thread-abc' })
     s1.set('k2', { threadId: 'thread-def' })
-    // persist is debounced — wait for the write
-    await new Promise((r) => setTimeout(r, 400))
+    // write-through: visible to a new instance immediately (a host may
+    // re-instantiate the store per request; a debounce lost tool-loop turns)
     const s2 = createSessionStore({ file, ttlMs: 60_000 })
     assert.equal(s2.take('k1')?.threadId, 'thread-abc')
     assert.equal(s2.take('k2')?.threadId, 'thread-def')
     assert.equal(s2.size, 0) // take() claims are persisted too
-    await new Promise((r) => setTimeout(r, 400))
     const s3 = createSessionStore({ file, ttlMs: 60_000 })
     assert.equal(s3.size, 0)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a stale instance does not clobber entries a faster turn wrote', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const path = await import('node:path')
+  const dir = mkdtempSync(path.join(tmpdir(), 'magpie-sess-'))
+  const file = path.join(dir, 'thread-sessions.json')
+  try {
+    // Both load the same (empty) file; the second is stale by the time it writes.
+    const a = createSessionStore({ file, ttlMs: 60_000 })
+    const b = createSessionStore({ file, ttlMs: 60_000 })
+    a.set('ka', { threadId: 'thread-a' })
+    b.set('kb', { threadId: 'thread-b' })
+    const c = createSessionStore({ file, ttlMs: 60_000 })
+    assert.equal(c.take('ka')?.threadId, 'thread-a', 'first turn survived')
+    assert.equal(c.take('kb')?.threadId, 'thread-b', 'second turn survived')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a long-lived instance sees entries another instance wrote', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const path = await import('node:path')
+  const dir = mkdtempSync(path.join(tmpdir(), 'magpie-sess-'))
+  const file = path.join(dir, 'thread-sessions.json')
+  try {
+    const stale = createSessionStore({ file, ttlMs: 60_000 })
+    const fresh = createSessionStore({ file, ttlMs: 60_000 })
+    fresh.set('k1', { threadId: 'thread-1' })
+    // A long-lived instance loaded before that write must still find it.
+    assert.equal(stale.has('k1'), true)
+    assert.equal(stale.take('k1')?.threadId, 'thread-1')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a take() is not resurrected by another instance writing later', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const path = await import('node:path')
+  const dir = mkdtempSync(path.join(tmpdir(), 'magpie-sess-'))
+  const file = path.join(dir, 'thread-sessions.json')
+  try {
+    const setup = createSessionStore({ file, ttlMs: 60_000 })
+    setup.set('kx', { threadId: 'thread-x' })
+    const claimer = createSessionStore({ file, ttlMs: 60_000 })
+    const stale = createSessionStore({ file, ttlMs: 60_000 })
+    claimer.take('kx')
+    stale.set('ky', { threadId: 'thread-y' })
+    const after = createSessionStore({ file, ttlMs: 60_000 })
+    assert.equal(after.has('kx'), false, 'claimed entry stays gone')
+    assert.equal(after.take('ky')?.threadId, 'thread-y')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

@@ -1530,6 +1530,7 @@ test('a guardrail stop is retried automatically before the client sees it', asyn
     const sent = f.state.userMessages.map((m) => m.payload.text)
     assert.equal(sent.length, 2, 'one retry on the same thread')
     assert.match(sent[1], /Continue the previous request/)
+    assert.ok(sent[1].includes('do the thing'), 'the retry keeps the turn (a fresh-thread retry carries the transcript)')
   } finally {
     await f.close()
   }
@@ -1597,7 +1598,10 @@ test('the current turn\'s injected instructions arrive whole; the tool spec give
   assert.ok(payload.text.includes('Do the thing.'))
   const events = await readSse(res)
   const said = events.map((e) => String(e.choices?.[0]?.delta?.content ?? '')).join('')
-  assert.match(said, /工具说明过长/)
+  // Description-only caps are silent by policy (schemas survive, and the cap
+  // hits every fresh session's first frame); a schema drop would be stated.
+  assert.ok(!said.includes('工具说明过长') && !said.includes('单帧上限'), `silent: ${said}`)
+  assert.ok(payload.text.includes('"required"') || payload.text.includes('"path"'), 'schemas survive')
 })
 
 test('a note in the reply does not start a new thread on the next turn', async () => {
@@ -1605,42 +1609,29 @@ test('a note in the reply does not start a new thread on the next turn', async (
   // we hash must contain it. Before this, every note broke the chain: a
   // subagent whose first turn was noted re-threaded on every subsequent turn,
   // and a long conversation that attached its transcript re-attached forever.
+  // Uses the attachment note (a loss the client must see); description-only
+  // caps are silent by policy and would not exercise this.
+  const { fn } = attachFetch()
+  const f = await startFakeQuick({})
   const sessions = createSessionStore()
-  const bigTools = Array.from({ length: 14 }, (_, i) => ({
-    type: 'function',
-    function: {
-      name: `Tool${i}`,
-      description: `Does the ${i}th thing. ` + 'd'.repeat(1500),
-      parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
-    },
-  }))
-  const rules = '<system-reminder>Codebase and user instructions are shown below. IMPORTANT: These instructions OVERRIDE any default behavior. ' + 'r'.repeat(16000) + ' RULES-TAIL</system-reminder>'
-  const sys = 'Rule with a "quote" and a tab\there.\n'.repeat(560)
-  const convo1 = [{ role: 'system', content: sys }, { role: 'user', content: rules + '\n\nDo it.' }]
-  // If this turn needs the transcript as an attachment, serve the upload
-  // locally: the fake Quick speaks WS only.
-  const attachFetch = async (url) => {
-    const u = String(url)
-    if (u.includes('upload-attachment')) return j({ attachmentId: 'att-note' })
-    if (u.includes('attachment-dlp-status')) return j({ dlpJobStatus: 'COMPLETED', policyAction: 'ALLOW' })
-    if (u.includes('qbs-event')) return j({ eventResponse: { invokeAgentResponse: { api_response: { status: 200, body: { path: '/p' } } } } })
-    return j({ error: 'unexpected' }, 404)
+  try {
+    const call = (messages) => handleChatCompletions({
+      body: { model: 'smart', messages },
+      outpostMgr: fakeMgr(f),
+      sessions,
+      options: { identity: 'note-reuse', log: () => {}, fetchImpl: fn },
+    })
+    const j1 = await (await call(oversizedConvo())).json()
+    const content = j1.choices[0].message.content
+    assert.match(content, /附件/, 'the first turn is noted')
+    const thread1 = f.state.userMessages.at(-1).threadId
+
+    const j2 = await (await call([...oversizedConvo(), { role: 'assistant', content }, { role: 'user', content: 'next step' }])).json()
+    assert.ok(!String(j2.choices[0].message.content).includes('附件'), 'the note is not repeated once the thread continues')
+    assert.equal(f.state.userMessages.at(-1).threadId, thread1, 'the same thread continues')
+  } finally {
+    await f.close()
   }
-  const call = (messages) => handleChatCompletions({
-    body: { model: 'fast', messages, tools: bigTools },
-    outpostMgr,
-    sessions,
-    options: { identity: 'note-reuse', log: () => {}, fetchImpl: attachFetch },
-  })
-
-  const j1 = await (await call(convo1)).json()
-  const content = j1.choices[0].message.content
-  assert.match(content, /工具说明过长/, 'the first turn is noted')
-  const thread1 = fake.state.userMessages.at(-1).threadId
-
-  const convo2 = [...convo1, { role: 'assistant', content }, { role: 'user', content: 'next step' }]
-  await (await call(convo2)).json()
-  assert.equal(fake.state.userMessages.at(-1).threadId, thread1, 'the same thread continues')
 })
 
 test('a dead cached thread is retried once on a fresh thread with the full transcript', async () => {
@@ -1677,6 +1668,92 @@ test('a dead cached thread is retried once on a fresh thread with the full trans
     assert.ok(retried.payload.text.includes('first task') && retried.payload.text.includes('keep going'),
       'the retry carries the whole conversation')
     assert.ok(retried.payload.text.includes('Tools provided by the client'), 'the retry re-sends the full tool spec')
+  } finally {
+    await f.close()
+  }
+})
+
+test('per-request store instances keep one thread across a fast turn loop', async () => {
+  // The plugin host may re-instantiate per request, so each turn here gets a
+  // FRESH store over the same file — exactly what a tool loop looks like. A
+  // debounced full-file rewrite used to lose the previous turn's anchor here,
+  // and the next request silently started a new thread (the "continue" after
+  // an interrupt then had no idea what the earlier request was).
+  const { mkdtempSync, rmSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const path = await import('node:path')
+  const dir = mkdtempSync(path.join(tmpdir(), 'magpie-loop-'))
+  const file = path.join(dir, 'thread-sessions.json')
+  const f = await startFakeQuick({})
+  try {
+    let convo = [{ role: 'user', content: 'start the loop' }]
+    let thread
+    for (let i = 0; i < 6; i++) {
+      const sessions = createSessionStore({ file }) // fresh instance per request
+      const res = await handleChatCompletions({
+        body: { model: 'fast', messages: convo },
+        outpostMgr: fakeMgr(f),
+        sessions,
+        options: { identity: 'loop-acct', log: () => {} },
+      })
+      assert.equal(res.status, 200)
+      const content = (await res.json()).choices[0].message.content
+      const used = f.state.userMessages.at(-1).threadId
+      if (thread) assert.equal(used, thread, `turn ${i} must reuse the thread`)
+      thread = used
+      convo = [...convo, { role: 'assistant', content }, { role: 'user', content: `step ${i}` }]
+    }
+    assert.equal(f.state.userMessages.length, 6)
+  } finally {
+    await f.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a guardrail retry on a reused thread keeps this turn\'s tool result', async () => {
+  let turn = 0
+  const f = await startFakeQuick({
+    script: (p) => {
+      turn++
+      if (turn === 1) {
+        return [
+          { type: 'text_delta', payload: { delta: 'Checking. <tool_call>{"name":"Read","arguments":{"file_path":"a.txt"}}</tool_call>' } },
+          { type: 'message_complete', payload: { text: '' } },
+        ]
+      }
+      if (turn === 2) return [{ type: 'guardrail_blocked', payload: { message: 'That content did not pass our automated check.' } }]
+      return [
+        { type: 'text_delta', payload: { delta: 'the answer' } },
+        { type: 'message_complete', payload: { text: 'the answer' } },
+      ]
+    },
+  })
+  const sessions = createSessionStore()
+  try {
+    const r1 = await handleChatCompletions({
+      body: { model: 'fast', messages: [{ role: 'user', content: 'read it' }], tools: [fnTool('Read')] },
+      outpostMgr: fakeMgr(f), sessions, options: { identity: 'guard-reuse', log: () => {} },
+    })
+    const m1 = (await r1.json()).choices[0].message
+    const r2 = await handleChatCompletions({
+      body: {
+        model: 'fast',
+        tools: [fnTool('Read')],
+        messages: [
+          { role: 'user', content: 'read it' },
+          { role: 'assistant', content: m1.content, tool_calls: m1.tool_calls },
+          { role: 'tool', tool_call_id: m1.tool_calls[0].id, content: 'file body' },
+        ],
+      },
+      outpostMgr: fakeMgr(f), sessions, options: { identity: 'guard-reuse', log: () => {} },
+    })
+    assert.equal(r2.status, 200)
+    assert.match((await r2.json()).choices[0].message.content, /the answer/)
+    const msgs = f.state.userMessages
+    assert.equal(msgs.length, 3, 'first turn, blocked attempt, one retry')
+    assert.equal(msgs[2].payload.threadId, msgs[1].payload.threadId, 'retry stays on the reused thread')
+    assert.match(msgs[2].payload.text, /\[tool_result/, 'the delta (tool result) is not lost')
+    assert.match(msgs[2].payload.text, /Continue the previous request/, 'the nudge is appended')
   } finally {
     await f.close()
   }
