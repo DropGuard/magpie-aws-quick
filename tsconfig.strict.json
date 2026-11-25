@@ -12,6 +12,7 @@
   "include": [
     "src/globals.d.ts",
     "src/protocol/**/*.ts",
-    "src/runtime/**/*.ts"
+    "src/runtime/**/*.ts",
+    "src/turn/**/*.ts"
   ]
 }

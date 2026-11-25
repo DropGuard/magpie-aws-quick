@@ -33,7 +33,7 @@ function crc32(data) {
 const HV = { BOOL_TRUE: 0, BOOL_FALSE: 1, BYTE: 2, SHORT: 3, INT: 4, LONG: 5, BYTES: 6, STRING: 7, TIMESTAMP: 8, UUID: 9 }
 
 function esDrain(buffer) {
-  const messages = []
+  const messages: any[] = []
   const n = buffer.length
   let pos = 0
   while (pos + 16 <= n) {
@@ -249,7 +249,7 @@ export class QuickSocket {
       const { messages, consumed } = esDrain(merged)
       this.buf = merged.slice(consumed)
       for (const m of messages) this._onEsMessage(m)
-    } catch (e) {
+    } catch (e: any) {
       this.log(`[ws] frame decode error: ${e.message}`)
     }
   }
@@ -351,9 +351,9 @@ export class QuickSocket {
     // will read — its reply tail would land on the thread's next turn
     if (signal?.aborted) throw new QuickWsError('aborted', { kind: 'abort' })
     if (this.waiters.has(threadId)) throw new QuickWsError(`thread ${threadId} already has an active turn`, { kind: 'busy' })
-    const q = []
+    const q: any[] = []
     let failed = null
-    let notify = null
+    let notify: ((v?: any) => void) | null = null
     // Stray terminals from the stopped turn can still land after the settle
     // resolved (Quick flushes them over a few hundred ms). Until this turn
     // shows real generation activity, drop terminal events so they can't end
@@ -375,7 +375,7 @@ export class QuickSocket {
       this.send({ type: 'user_message', payload: { thread_id: threadId, ...payload } })
       for (;;) {
         while (q.length) {
-          const evt = q.shift()
+          const evt = q.shift()!
           if (guardTerminals) {
             // real errors still surface; only a completion tail is stale
             if (TERMINAL_EVENTS.has(evt.type) && evt.type !== 'error') continue

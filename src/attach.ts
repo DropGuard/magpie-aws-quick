@@ -88,7 +88,7 @@ export async function uploadFile({ session, name, mimeType = 'application/octet-
       body: data,
       signal,
     })
-  } catch (e) {
+  } catch (e: any) {
     if (isAbort(e, signal)) throw e
     throw fail('upload', `upload request failed: ${e?.message ?? e}`)
   }
@@ -103,7 +103,7 @@ export async function uploadFile({ session, name, mimeType = 'application/octet-
   for (let i = 0; i < maxPolls; i++) {
     try {
       r = await fetchImpl(`${base}attachment-dlp-status?attachmentId=${encodeURIComponent(attachmentId)}`, { headers, signal })
-    } catch (e) {
+    } catch (e: any) {
       if (isAbort(e, signal)) throw e
       throw fail('dlp', `dlp status check failed: ${e?.message ?? e}`)
     }
@@ -143,7 +143,7 @@ export async function uploadFile({ session, name, mimeType = 'application/octet-
       body: JSON.stringify(evt),
       signal,
     })
-  } catch (e) {
+  } catch (e: any) {
     if (isAbort(e, signal)) throw e
     throw fail('deliver', `deliver request failed: ${e?.message ?? e}`)
   }

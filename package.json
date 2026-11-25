@@ -14,7 +14,8 @@
   ],
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "typecheck": "tsc --noEmit && tsc -p tsconfig.strict.json"
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.strict.json",
+    "diff:reference": "node scripts/differential.mjs"
   },
   "keywords": [
     "opencode",

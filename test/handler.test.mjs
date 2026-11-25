@@ -1642,3 +1642,42 @@ test('a note in the reply does not start a new thread on the next turn', async (
   await (await call(convo2)).json()
   assert.equal(fake.state.userMessages.at(-1).threadId, thread1, 'the same thread continues')
 })
+
+test('a dead cached thread is retried once on a fresh thread with the full transcript', async () => {
+  let calls = 0
+  const f = await startFakeQuick({
+    script: (p) => {
+      calls++
+      // turn 1: normal reply (creates the session entry); turn 2 runs on the
+      // cached thread and fails the way a server-side thread loss does.
+      return calls === 2 ? [{ type: 'error', payload: { message: 'thread not found' } }] : defaultScript(p)
+    },
+  })
+  const sessions = createSessionStore()
+  const mgr = fakeMgr(f)
+  const tools = [fnTool('Bash')]
+  const options = { identity: 'stale-thread-acct', log: () => {} }
+  const convo1 = [{ role: 'user', content: 'first task' }]
+  try {
+    const j1 = await (await handleChatCompletions({ body: { model: 'fast', messages: convo1, tools }, outpostMgr: mgr, sessions, options })).json()
+    const content = j1.choices[0].message.content
+
+    const convo2 = [...convo1, { role: 'assistant', content }, { role: 'user', content: 'keep going' }]
+    const res2 = await handleChatCompletions({ body: { model: 'fast', messages: convo2, tools }, outpostMgr: mgr, sessions, options })
+    assert.equal(res2.status, 200)
+    await res2.json()
+
+    const msgs = f.state.userMessages
+    assert.equal(msgs.length, 3, 'original turn, reused attempt, one retry')
+    const reused = msgs[1]
+    const retried = msgs[2]
+    assert.equal(reused.threadId, msgs[0].threadId, 'the second request starts on the cached thread')
+    assert.notEqual(retried.threadId, reused.threadId, 'the retry lands on a fresh thread')
+    assert.ok(reused.payload.text.includes('Client tool calling — reminder'), 'the reused attempt was a delta')
+    assert.ok(retried.payload.text.includes('first task') && retried.payload.text.includes('keep going'),
+      'the retry carries the whole conversation')
+    assert.ok(retried.payload.text.includes('Tools provided by the client'), 'the retry re-sends the full tool spec')
+  } finally {
+    await f.close()
+  }
+})

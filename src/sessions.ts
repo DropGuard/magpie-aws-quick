@@ -103,7 +103,7 @@ export function createSessionStore({ ttlMs = SESSION_DEFAULTS.ttlMs, max = SESSI
       }
     } catch { /* missing/corrupt → start empty */ }
   }
-  let saveTimer = null
+  let saveTimer: any = null
   const persist = () => {
     if (!file) return
     clearTimeout(saveTimer)
