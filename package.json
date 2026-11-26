@@ -6,6 +6,7 @@
   "main": "./src/index.ts",
   "files": [
     "src",
+    "bin",
     "README.md",
     "README.zh-CN.md",
     "PROTOCOL.md",
@@ -32,7 +33,7 @@
   "bugs": {
     "url": "https://github.com/httpdone/magpie-aws-quick/issues"
   },
-  "license": "MIT",
+  "license": "GPL-3.0-only",
   "engines": {
     "node": ">=22"
   },

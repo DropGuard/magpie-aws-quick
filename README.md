@@ -64,8 +64,9 @@ What the plugin does:
    OpenAI `content`/`reasoning_content`/`usage`. A user turn ends at
    `message_complete` with `continuation_expected !== true` — the same
    rule the desktop renderer uses.
-5. **Thread reuse (on by default)**: exact continuation tracking over an
-   incremental hash chain — see [Thread reuse](#thread-reuse) below.
+5. **Thread reuse (on by default)**: the account, the gateway session key and
+   the message-key prefix decide whether a request continues a thread — see
+   [Thread reuse](#thread-reuse) below.
 
 Device ids: the desktop app always sends its profile's `device_id` as `outpostId`, so direct sessions send a stable per-account one too instead of an empty value. Credential Manager sign-ins reuse the desktop profile's own `device_id` (read-only); OAuth accounts get a UUID generated once at sign-in and stored on the account record, kept across token refreshes and re-logins. The same id goes into oversized-image delivery. Accounts never share an id, and an id is never rotated. `stableDeviceId: false` goes back to the empty value. The local-outpost backend uses whatever id Quick's own agent reports; the agent inherits `QUICKWORK_BASE` / `QUICKWORK_ROOT` from the environment.
 
@@ -75,27 +76,31 @@ Quick keeps conversation history server-side per `thread_id`, but OpenAI
 clients resend the entire transcript on every request. The plugin makes one
 decision:
 
-- **Incremental hash chain** — each request computes `h[k] = H(scope,
-  m1…mk)` over the message list, with an assistant message counted as a
-  placeholder only: its text and tool-call ids are **not** hashed. A client
-  rewriting its own reply (trimming, notes, regenerated ids, dropped
-  thinking) cannot break the chain. A hit means only the new user/tool tail
-  goes upstream; Quick's server-side history supplies the rest.
-- **A new thread only when history itself changed** — an edited or
-  compacted user/tool message changes the chain, so the plugin starts a
-  fresh thread and re-sends the transcript it now has. The old thread no
-  longer describes the client's conversation; continuing it is how a model
-  ends up working from a 500k-token history the client already compacted.
-- **Identity is account + conversation key + message prefix** — the system
+- **A thread is a message-key prefix** — each user/tool message contributes a
+  hash of its role, tool-call id, tool name and normalized text; an assistant
+  message is the single wildcard `assistant`. The client re-sending its own
+  rendering of our reply (trimming, notes, regenerated ids, dropped thinking)
+  therefore still matches. A hit sends only the new user/tool tail upstream;
+  Quick's server-side history supplies the rest.
+- **A new thread only when history itself changed** — an edited, rewound or
+  compacted user/tool message changes its key, so the stored prefix stops
+  matching and the plugin starts a fresh thread with the transcript it now has.
+  Continuing the old thread is how a model ends up working from a 500k-token
+  history the client already compacted. A request whose new tail contains an
+  assistant message does not match either: the client holds more history than
+  the stored thread describes.
+- **Identity is account + gateway session key + message prefix** — the system
   prompt, agent mode, tool list and thinking effort are not part of it. Claude
   Code changes its own system prompt mid-session (memory, billing, ToolSearch)
   or switches model tier; that must not discard the thread.
-- **Failure-safe** — a reused turn that errors or is cancelled (499, content
-  filter, idle timeout) puts its thread back, so the next request continues it.
+- **A match is single-use** — taking an entry removes it from the store, so two
+  requests cannot append to one thread. A reused turn that errors or is
+  cancelled (499, content filter, idle timeout) puts its thread back, so the
+  next request continues it.
 - **Bounded memory** — entries expire after 24h idle and the store is
   LRU-capped at 200 threads. The cache persists to `thread-sessions.json`
-  (message-key hashes + thread ids + tool names only, no content), so reuse survives
-  plugin reloads.
+  (account identity, session key, message-key hashes, thread ids and tool
+  names — no message content), so reuse survives plugin reloads.
 
 This is much simpler than the old three-tier matcher (hash chain + fuzzy
 anchors + session-key fallback) and removes both the cross-chat session-key
@@ -117,7 +122,9 @@ concrete model (`resolved_model_id`/`served_model_id` in `turn_usage`):
 | `advanced` | advanced | (may normalize to smart) |
 
 The `X-Magpie-Effort` header (or body's `reasoning_effort`/`thinking_effort`)
-maps to `thinking_effort`: `off/low/medium/high/max`.
+maps to `thinking_effort`: `off/low/medium/high/max`. `max` is capped to
+`high` by default (`thinkingEffortCap`); set the cap to `max` to pass it
+through.
 
 ## Install
 
@@ -138,8 +145,10 @@ maps to `thinking_effort`: `off/low/medium/high/max`.
     back to spawning the bundled `quickwork-agent --outpost-only`, which
     reuses the app's login state — **the desktop app does not need to stay
     running**; the session lives in the OS credential store.
-- **Node ≥ 22**: only needed to run tests; the plugin itself is pure ESM with
-  zero third-party dependencies.
+- **Node ≥ 22.18**: needed for tests and `bin/serve.mjs`, which import the
+  TypeScript sources directly (unflagged type stripping starts at 22.18). The
+  plugin itself is loaded by magpie's Bun host and has zero runtime
+  dependencies; `typescript` and `@types/node` are dev-only.
 
 ### 2. Install the plugin
 
@@ -208,15 +217,21 @@ A few plugin options tune request handling (`magpie plugin options aws-quick '{�
 - `stableDeviceId` (default `true`): direct sessions send a stable
   per-account device id as `outpostId` (see Device ids above); `false` sends
   an empty value.
+- `keepSessions` (default `false`): when true, chats are listed in Amazon Quick
+  (its chat list and memory); the default keeps every chat incognito.
+  `keep_sessions` is accepted too, for the old bridge's settings file.
+- `sessionReuse` (default `true`): continue Quick threads across turns; `false`
+  sends every request on a fresh thread. `sessionTtlMs` (default 24h) and
+  `sessionMax` (default 200) bound the cache.
 - `guardrailRetries` (default `1`): when Quick's server-side content check stops a turn (a canned sentence with usage 0/0), the plugin retries it on the same thread before the client ever sees the block; `0` disables, surfacing the block.
 - `callRetries` (default `1`): when an `<invoke>` block is incomplete or a `<parameter>` is malformed, ask the model to resend it on the same thread first (split large content if needed). Only if that fails does the placeholder `aws_quick_invalid_tool_call` reach the client. It does not retry when prose or valid calls were already streamed, to avoid duplicates.
-- `answerRetries` (default `0`): a turn can finish normally with reasoning but no text and no tool call. Claude Code shows "Thought for Ns" and then an empty assistant message, so the task stalls. The default is a loud 502 — retrying only buys another multi-minute silence. Set it to `1` to ask again on the same thread ("answer now", one effort level lower).
+- `answerRetries` (default `0`): a turn can finish normally with reasoning but no text and no tool call. Claude Code shows "Thought for Ns" and then an empty assistant message, so the task stalls. The default is a loud 502 — retrying only buys another multi-minute silence. Set it to `1` to ask again on the same thread ("answer now", one effort level lower). One coupled exception: if a guardrail retry just ran, an empty result asks once more even at `0`, because the manual "continue" would be exactly that request.
 - `thinkingEffortCap` (default `high`, matching the old bridge): ceiling for a requested thinking effort. `medium`/`high` pass through; only `max` becomes `high`. `'max'` disables the ceiling, `'medium'` is faster.
 - `contextWindow` (default `1000000`, Quick's own value): optional cap on the client's context window. Lowering it makes Claude Code compact earlier, which is usually a bad trade for a file-reading agent.
 
 **Why max is capped by default.** Across 368 measured `max` turns the median output was 2,442 tokens, p90 ~26k and the maximum 63,322 (right at the 64k cap); median turn time was 34 s, p90 4m47s, max 21m49s. The old bridge never sent `max`: it mapped `max/xhigh` to `high` in its gateway. That is a large part of why it was slower but usable.
 
-**64 KB frames and tool results.** One 17k-token Read result is ~68 KB — larger than a whole frame. The plugin must either cut it (the model re-runs the same read) or upload it (the model spends a server-side step reading it back). The tool instructions now ask the client to read in 300–400-line chunks and trim command output with head/tail; that is the only place where the re-read loop can be avoided at the source.
+**64 KB frames and tool results.** One 17k-token Read result is ~68 KB — larger than a whole frame. The plugin must either cut it (the model re-runs the same read) or upload it (the model spends a server-side step reading it back). When the frame has to cut a tool result of 8 KB or more, the full text is uploaded and the frame keeps a head/tail preview pointing at the file; a shorter cut gets a marker saying that repeating the same call returns the same cut, and that only a narrower range (offset/limit) recovers the middle. The tool preamble also tells the model that earlier results may be truncated and to call again rather than guess from memory.
 
 ## FAQ
 
@@ -245,10 +260,10 @@ browser or in a private/incognito window, without signing out of the others.
   the client are injected as an Anthropic-style `<invoke>/<parameter>` XML
   convention and parsed back into standard `tool_calls`; `tool`-role results
   render as `<tool_result …>` blocks continuing the same thread. The full tool spec is sent
-  once per thread; later turns on a reused thread carry only a short
-  reminder, because everything in the message stays in Quick's thread
-  history and counts toward the context. Reliability depends on the
-  model honoring the convention — verified stable under
+  on a fresh thread and for tools added later; other turns on a reused thread
+  carry only a short reminder, because everything in the message stays in
+  Quick's thread history and counts toward the context. Reliability depends
+  on the model honoring the convention — verified stable under
   `tool_choice:'required'` for smart/advanced; occasionally the model answers
   directly with its own tools (e.g. web search) instead, which shows up as a
   plain-text reply. If the model instead invokes a client-declared tool
@@ -269,10 +284,13 @@ browser or in a private/incognito window, without signing out of the others.
   `id_token` / `ws_host`, which is all the upload flow needs (verified live).
 - **Sampling params**: `temperature` etc. don't exist in the protocol and are
   ignored server-side (`capabilities.temperature:false`).
-- **Sessions are account-bound**: the thread-reuse scope includes an account
-  identity hash; switching accounts transparently invalidates old threads.
+- **Sessions are account-bound**: a thread is only continued for the same
+  account identity and gateway session key; switching accounts transparently
+  invalidates old threads.
 - **Concurrency**: different threads can run turns in parallel on one
-  QuickSocket; concurrent requests on the same thread are rejected (`busy`).
+  QuickSocket. Requests for the same conversation wait briefly for the previous
+  turn (so a fast follow-up after an interrupt continues the same thread); if
+  two requests still reach one thread at once, the second is rejected (`busy`).
 - **OAuth sign-in is consumer/social only**: it replays the desktop app's
   `quick.aws.com/sn` flow (`social` provider). Enterprise-IdP tenants whose
   issuer is not the Amazon social IdP may not complete this flow — use the
@@ -304,10 +322,10 @@ browser or in a private/incognito window, without signing out of the others.
 
 - The instance token is randomly generated per launch and passed to the child
   **only** via stdin — never written to disk or logs.
-- On the local-credentials path, `id_token`/`ws_host`/`actor_arn` etc. live
-  only in memory; session-cache entries store only hashes + thread ids —
-  persisted to `thread-sessions.json` (no message content) so thread reuse
-  survives plugin reloads.
+- On the local-credentials path, `id_token`/`ws_host` etc. live only in memory;
+  session-cache entries persist to `thread-sessions.json` and hold the account
+  identity, the gateway session key, message-key hashes, thread ids and tool
+  names — no message content — so thread reuse survives plugin reloads.
 - On the OAuth path, `{type:'oauth', tokens:{access_token, refresh_token, id_token, expires_at}, client:{client_id, client_secret, …}, tenant_url, ws_host, …}` is persisted in
   `oauth-sessions.json` (mode `0600`) — unavoidable for refresh-token
   rotation, equivalent to the desktop app keeping its sign-in in the OS
@@ -326,15 +344,33 @@ browser or in a private/incognito window, without signing out of the others.
 
 ```bash
 npm test          # node --test test/*.test.mjs (fake WS server, no real account)
-node _research/smoke-plugin.mjs fast   # live smoke (needs Quick signed in locally)
+npm run typecheck # tsc --noEmit, then tsconfig.strict.json
 ```
 
-Protocol details in [PROTOCOL.md](PROTOCOL.md). Research notes and captures
-live in `_research/` (not shipped with the plugin).
+Protocol details in [PROTOCOL.md](PROTOCOL.md). The tests import the
+TypeScript sources directly, so Node's type stripping must be available
+(22.18+).
+
+## Credits
+
+The rework in this plugin follows
+**[magpie-AWS-Quick-bridge](https://github.com/DaBinBinah/magpie-AWS-Quick-bridge)**
+by [DaBinBinah](https://github.com/DaBinBinah) (npm:
+`magpie-aws-quick-bridge`). The account + session-key + message-prefix thread
+matcher, the `<invoke>/<parameter>` tool convention with the spec in
+`custom_prompt` and a reminder after each user message, the short prompt
+framing, the `high` thinking-effort cap, the incognito default
+(`keep_sessions`) and the context-attachment handling are all ported from it.
+It made Quick usable with Claude Code long before this fork existed, and its
+protocol notes are why the reverse-engineered parts here are understood at
+all. Thank you.
+
+That project is GPL-3.0; the parts ported from it keep that license, and
+this repository is GPL-3.0 for that reason.
 
 ## License
 
-MIT. Amazon Quick is an AWS product; this plugin is not affiliated with
+GPL-3.0. Amazon Quick is an AWS product; this plugin is not affiliated with
 Amazon/AWS.
 
 ## Community

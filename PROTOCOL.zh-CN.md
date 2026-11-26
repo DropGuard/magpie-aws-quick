@@ -199,11 +199,13 @@ Quick 自有 agent 工具的服务端执行过程，`message_complete.tool_calls
 
 可行的桥接（插件采用，已实测跑通）：
 
-1. 把 OpenAI `tools[]` + `tool_choice` 渲染成一段 `[Tool-use convention]` 指令，
-   拼进 `user_message.payload.text`（协议没有 system-prompt 通道，只能走正文）。
+1. 把 OpenAI `tools[]` + `tool_choice` 渲染成一段 `[Client tool calling]` 指令，
+   放进 `user_message.payload.custom_prompt`——这是 Quick 真正会记住的
+   每轮指令通道（`system_prompt` 的内容不会被记住，见 §5）。
    同时置 `web_search_enabled:false`，减少模型调用自带联网工具"抢答"。
 2. 模型把调用输出为纯文本 `<function_calls><invoke name="…"><parameter name="…">value</parameter></invoke></function_calls>`
-   （tag 可能跨 `text_delta` 切分，插件做了 holdback 解析，见 `lib/tools.mjs`）。
+   （tag 可能跨 `text_delta` 切分，`src/tools.ts` 增量解析并 holdback 未完成的
+   tag）。
 3. 解析结果映射为 OpenAI `tool_calls`；`finish_reason:"tool_calls"`。
 4. 客户端回传 `role:"tool"` 结果 → 渲染为 `<tool_result tool_use_id="<id>">content</tool_result>`
    续接同一 thread（delta 里只含新增 tool/user 内容）。
@@ -289,5 +291,5 @@ OpenAI `tool_calls`。
 - `connected.payload.user` 含邮箱/姓名/账号 id——**不要打印原始事件**。
 - 整个 `user_message` 帧有 64KB 上限（超限服务端拒发 `FrameTooLarge`；
   已实测 `text` 与 `system_prompt` 共享该预算），插件在
-  `lib/handler.mjs`/`lib/translate.mjs`/`lib/tools.mjs` 里做了尺寸预算；
+  `src/protocol/frame.ts`/`src/translate.ts`/`src/tools.ts` 里做了尺寸预算；
   渲染文本始终 <60KB。

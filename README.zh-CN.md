@@ -49,8 +49,8 @@ Python 后端（`quickwork-agent`，打包在 `resources/agent.zip` 里），以
    `message_complete` 转成 OpenAI 的 `content`/`reasoning_content`/`usage`。
    一个 user turn 以 `message_complete`（`continuation_expected !== true`）
    结束——与桌面渲染端判定一致。
-5. **会话复用（默认开启）**：三级续接判定——见下文
-   [会话复用](#会话复用thread-reuse)。
+5. **会话复用（默认开启）**：账号、网关会话键和消息 key 前缀共同决定是否续接
+   同一 thread——见下文 [会话复用](#会话复用thread-reuse)。
 
 设备 ID：官方桌面端连接时总会把 profile 里的 `device_id` 作为 `outpostId` 发出去，所以直连会话也发一个按账号固定的 ID，不再发空值。
 凭据管理器登录直接用桌面端 profile 里的 `device_id`（只读）；OAuth 账号在登录时生成一个 UUID，存在账号记录里，刷新令牌和重新登录都保持不变。
@@ -62,22 +62,25 @@ Python 后端（`quickwork-agent`，打包在 `resources/agent.zip` 里），以
 Quick 在服务端按 `thread_id` 保存会话历史，而 OpenAI 客户端每次请求都重发
 完整 transcript。本插件只做一种判定：
 
-- **增量哈希链** —— 每个请求对消息列表计算 `h[k] = H(scope, m1…mk)`，其中
-  assistant 消息只按一个占位符计入，**不把正文或 tool_call id 写进哈希**。
-  客户端重写自己的回复（裁剪、note、重新生成 id、丢 thinking）不影响续接；
-  命中即只把新增的 user/tool 尾部发给上游，更早的历史由 Quick 服务端保存。
-- **只在真正的历史编辑处换 thread** —— user/tool 消息的内容变了（编辑、
-  客户端 compaction、历史手术），哈希链就断，插件新建 thread 并重发当前
-  transcript。旧 thread 的服务端上下文已经和客户端手里的对话不一致；继续
-  续它就是“模型记得的东西”和“客户端以为它记得的东西”分叉。
-- **thread 身份只看账号、会话键和消息前缀** —— system prompt、agent_mode、
+- **一个 thread 就是一段消息 key 前缀** —— 每条 user/tool 消息贡献一个哈希
+  （角色、tool_call_id、工具名、归一化后的正文）；assistant 消息统一记为
+  通配符 `assistant`。客户端重发它自己渲染的回复（裁剪、附加 note、重新生成
+  调用 id、丢掉 thinking）仍然命中；命中时只把新增的 user/tool 尾部发给上游，
+  更早的历史由 Quick 服务端保存。
+- **只有历史本身变了才换 thread** —— 编辑、回退或 compaction 改写了某条
+  user/tool 消息，它的 key 就变了，已存前缀不再匹配，插件新建 thread 并重发
+  当前 transcript。继续旧 thread 就是让模型基于客户端早已压缩掉的 500k token
+  历史工作。新尾部里出现 assistant 消息的请求同样不匹配：客户端手里的历史比
+  已存 thread 描述的更多。
+- **thread 身份只看账号、网关会话键和消息前缀** —— system prompt、agent_mode、
   工具列表、思考强度都不参与。Claude Code 会在会话中途改 system prompt
   （memory、billing、ToolSearch）或换模型档位，这些变化不该丢掉 thread。
-- **失败不丢 thread** —— 复用的这一轮出错或被取消（499、内容过滤、空闲超时）时，
-  原 thread 放回缓存，下一次请求照样续接。
+- **命中即取走** —— 匹配成功会把条目从缓存里移除，两个请求不可能同时往一个
+  thread 里追加；这一轮出错或被取消（499、内容过滤、空闲超时）时再放回去，
+  下一次请求照样续接。
 - **有界内存** —— 条目空闲 24 小时过期，LRU 上限 200 个 thread。缓存持久化到
-  `thread-sessions.json`（只存消息 key 哈希、thread id 和工具名，无内容），插件重载后
-  仍可续接。
+  `thread-sessions.json`（账号身份、会话键、消息 key 哈希、thread id 和工具名，
+  无消息内容），插件重载后仍可续接。
 
 这比旧版的三级判定（哈希链 + 模糊锚点 + 会话键兜底）简单得多，也去掉了
 “跨会话 session key 碰撞”和“compaction 后继续续旧 thread”两类问题。代价是：
@@ -97,7 +100,8 @@ Quick 的 `user_message` 用 `agent_mode` 选择档位，服务端再路由到�
 | `advanced` | advanced | （服务端可能归一到 smart） |
 
 `X-Magpie-Effort` 头（或 body 的 `reasoning_effort`/`thinking_effort`）映射到
-`thinking_effort`：`off/low/medium/high/max`。
+`thinking_effort`：`off/low/medium/high/max`。`max` 默认会被压成 `high`
+（`thinkingEffortCap`）；把上限设成 `max` 才会原样透传。
 
 ## 安装
 
@@ -115,7 +119,9 @@ Quick 的 `user_message` 用 `agent_mode` 选择档位，服务端再路由到�
     outpost**；token 过期走 OIDC 自动续期并写回，桌面端不受影响。其他平台
     （或读取失败时）回退到拉起内置 `quickwork-agent --outpost-only`，复用
     应用登录态——**不需要**桌面端保持运行，登录态存在系统凭据存储里。
-- **Node ≥ 22**：只在跑测试时需要；插件本身是纯 ESM、无第三方依赖。
+- **Node ≥ 22.18**：跑测试和 `bin/serve.mjs` 时需要（它们直接 import
+  TypeScript 源码，Node 从 22.18 起默认开启类型擦除）；插件本身由 magpie 的
+  Bun 宿主加载，运行时零第三方依赖，`typescript`/`@types/node` 只用于开发。
 
 ### 2. 安装插件
 
@@ -176,15 +182,21 @@ magpie login aws-quick              # 按提示选择登录方式
   `false` 隐藏。
 - `stableDeviceId`（默认 `true`）：直连会话把按账号固定的设备 ID 作为
   `outpostId` 发送（见上文"设备 ID"）；`false` 改发空值。
+- `keepSessions`（默认 `false`）：设为 `true` 时聊天会出现在 Amazon Quick
+  的会话列表和记忆里；默认所有聊天都是 incognito。也接受旧桥设置文件里的
+  `keep_sessions` 拼写。
+- `sessionReuse`（默认 `true`）：跨轮续接 Quick thread；设为 `false` 则每个
+  请求都开新 thread。`sessionTtlMs`（默认 24 小时）和 `sessionMax`（默认
+  200）限制缓存规模。
 - `guardrailRetries`（默认 `1`）：一轮被 Quick 服务端审核拦下（回复里只有一句固定文案、usage 为 0）时，插件在客户端看到之前自动在同一 thread 上重试几次；`0` 关闭，直接把拦截交给客户端。
 - `callRetries`（默认 `1`）：模型输出的 `<invoke>` 块没写完或 `<parameter>` 不合法时，先在同一 thread 上要求它重发（必要时拆小）；只有在它仍然失败时才把占位调用 `aws_quick_invalid_tool_call` 交给客户端。客户端已经在上一轮看到了正文或有效工具调用时不再重试，避免重复。
-- `answerRetries`（默认 `0`）：一轮正常结束、但只输出了推理、正文和工具调用都为空（Claude Code 里表现为 “Thought for Ns” 后什么都不写）时，默认直接以 502 报错，而不是再花几分钟重试——重试解决不了模型不收敛的问题。设为 `1` 才会在同一 thread 上再要求模型直接回答，并把思考强度降一档。
+- `answerRetries`（默认 `0`）：一轮正常结束、但只输出了推理、正文和工具调用都为空（Claude Code 里表现为 “Thought for Ns” 后什么都不写）时，默认直接以 502 报错，而不是再花几分钟重试——重试解决不了模型不收敛的问题。设为 `1` 才会在同一 thread 上再要求模型直接回答，并把思考强度降一档。例外：如果刚发生过一次审核重试，空回答会再多要一次（即使为 `0`），因为这正是用户通常会手动输入的 continue。
 - `thinkingEffortCap`（默认 `high`，对齐旧桥）：给客户端的思考强度设上限。你设 `medium` 就发 `medium`，设 `high` 就发 `high`，只有 `max` 会被压成 `high`；`'max'` 可关闭封顶，`'medium'` 更快。
 - `contextWindow`（默认 `1000000`，即 Quick 自己报的值）：可选的客户端上下文上限。调低会让 Claude Code 更早 compaction；对读文件的 agent 通常不划算。
 
 **为什么默认压掉 max？** 实测（Claude Code + `smart`，`max` 强度，368 轮）：输出 token 中位数 2442、P90 约 2.6 万、最大 63322（正好贴着 64k 输出上限）；单轮耗时中位数 34 秒、P90 4 分 47 秒、最长 21 分 49 秒。旧桥从来不把 `max` 发给 Quick：它在网关层就把 `max/xhigh` 映射成 `high`。这是它“慢但能用”的主要原因之一。
 
-**64KB 单帧与工具结果。** 一个 17k token 的 Read 结果约 68KB，本身就超过一帧；插件要么截断（模型会重跑同一个调用），要么上传成附件（模型要多花一个服务端步骤去读）。所以能分块读的地方就分块读、命令输出用 head/tail；这是从源头减少重读循环的位置。
+**64KB 单帧与工具结果。** 一个 17k token 的 Read 结果约 68KB，本身就超过一帧；插件要么截断（模型会重跑同一个调用），要么上传成附件（模型要多花一个服务端步骤去读）。当一帧放不下、需要截断 8KB 以上的工具结果时，完整内容会先上传成附件，帧里保留头尾预览和指向文件的说明；更小的结果带一个标记，说明重复同一个调用只会得到同样的截断，只有缩小范围（offset/limit）才能拿回中间部分。工具说明里也会告诉模型：更早的工具结果可能被截断，需要时重新调用，不要凭记忆猜。
 
 ## 常见问题
 
@@ -224,8 +236,8 @@ magpie login aws-quick              # 按提示选择登录方式
   都可用：outpost 的 `sncs-session` 同样提供上传所需的 `id_token` /
   `ws_host`（已实测）。
 - **采样参数**：`temperature` 等不在协议内，传了也会被服务端忽略（`capabilities.temperature:false`）。
-- **会话与账号绑定**：thread 复用的 scope 里包含账号身份哈希；换号后旧 thread 自动失效重建。
-- **多窗口/并发**：同一 QuickSocket 上不同 thread 可并行 turn；同一 thread 的并发请求会被拒绝（`busy`）。
+- **会话与账号绑定**：只有账号身份和网关会话键都相同时才会续接 thread；换号后旧 thread 自动失效重建。
+- **多窗口/并发**：同一 QuickSocket 上不同 thread 可并行 turn。同一会话的请求会先等上一轮结束（有上限），所以中断后立刻追问仍会续接同一 thread；如果两个请求仍同时落到一个 thread 上，第二个会被拒绝（`busy`）。
 - **消息体积**：整个 `user_message` 帧服务端上限 64KB（`text` 与
   指令及附件共享）。超大 system prompt / 工具 schema / 会话历史会自动
   压缩（schema 去注解、工具规格 lite→仅名字降级、tool_result 封顶）。整段对话装不进
@@ -248,9 +260,9 @@ magpie login aws-quick              # 按提示选择登录方式
 ## 安全与凭据
 
 - instance token 是插件每次启动随机生成的，**只**通过 stdin 交给子进程，不落盘、不进日志。
-- 本地凭据路径下 `id_token`/`ws_host`/`actor_arn` 等只在内存中流转；会话缓存
-  只存哈希 + thread id（无消息内容），持久化到 `thread-sessions.json`，
-  插件重载后仍可续接 thread。
+- 本地凭据路径下 `id_token`/`ws_host` 等只在内存中流转；会话缓存持久化到
+  `thread-sessions.json`，里面是账号身份、网关会话键、消息 key 哈希、thread id
+  和工具名，没有消息内容；插件重载后仍可续接 thread。
 - OAuth 路径会把 `{type:'oauth', tokens:{access_token, refresh_token, id_token, expires_at}, client:{client_id, client_secret, …}, tenant_url, ws_host, …}` 存入
   `oauth-sessions.json`（0600）——这是 refresh token 轮换的必然要求，
   与 Quick 桌面端自身在系统凭据存储里保存登录态等价；请保护好自己的用户目录。
@@ -266,14 +278,30 @@ magpie login aws-quick              # 按提示选择登录方式
 
 ```bash
 npm test          # node --test test/*.test.mjs（fake WS server，无需真账号）
-node _research/smoke-plugin.mjs fast   # 真实冒烟（需要本机 Quick 已登录）
+npm run typecheck # tsc --noEmit，然后 tsconfig.strict.json
 ```
 
-协议细节见 [PROTOCOL.zh-CN.md](PROTOCOL.zh-CN.md)。研究过程与抓包记录在 `_research/`（不随插件发布）。
+协议细节见 [PROTOCOL.zh-CN.md](PROTOCOL.zh-CN.md)。测试直接 import TypeScript
+源码，需要 Node 的类型擦除（22.18+）。
+
+## 鸣谢
+
+本插件的重构来自
+**[magpie-AWS-Quick-bridge](https://github.com/DaBinBinah/magpie-AWS-Quick-bridge)**
+（作者 [DaBinBinah](https://github.com/DaBinBinah)，npm 包
+`magpie-aws-quick-bridge`）：按「账号 + 会话键 + 消息前缀」判定 thread 的复用
+模型、把工具说明放进 `custom_prompt` 并在每条 user message 后附提醒的
+`<invoke>/<parameter>` 约定、简短的提示词框架、默认把 `max` 压到 `high`、
+默认 incognito（`keep_sessions`）以及超长上下文的附件处理，都是照它移植的。
+在这个 fork 出现之前，它就已经让 Quick 能在 Claude Code 里干活；本仓库对协议
+细节的理解也有很大一部分来自它的文档和实现。谢谢作者。
+
+该项目采用 GPL-3.0；从中移植的部分沿用同一许可，本仓库因此整体采用
+GPL-3.0。
 
 ## 许可
 
-MIT。Amazon Quick 是 AWS 的产品，本插件与 Amazon/AWS 无隶属关系。
+GPL-3.0。Amazon Quick 是 AWS 的产品，本插件与 Amazon/AWS 无隶属关系。
 
 ## 社区
 

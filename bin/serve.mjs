@@ -14,9 +14,9 @@
 import { createServer } from 'node:http'
 import { fileURLToPath } from 'node:url'
 import { resolve } from 'node:path'
-import { handleChatCompletions, handleModels } from '../lib/handler.mjs'
-import { createOutpostManager } from '../lib/outpost.mjs'
-import { createSessionStore, SESSION_DEFAULTS } from '../lib/sessions.mjs'
+import { handleChatCompletions, handleModels } from '../src/handler.ts'
+import { createOutpostManager } from '../src/outpost.ts'
+import { createSessionStore, SESSION_DEFAULTS } from '../src/sessions.ts'
 
 export function createProxyServer({ options = {}, token = '', outpostMgr, sessions } = {}) {
   return createServer(async (req, res) => {

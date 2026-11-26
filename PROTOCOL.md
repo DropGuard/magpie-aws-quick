@@ -208,14 +208,15 @@ serves its own tool loop — an external `user_message` cannot inject a
 
 The workable bridge (adopted by the plugin, verified end-to-end):
 
-1. Render OpenAI `tools[]` + `tool_choice` into a `[Tool-use convention]`
-   instruction block appended to `user_message.payload.text` (there is no
-   system-prompt channel, so it has to ride in the body). Also set
-   `web_search_enabled:false` to reduce the model "answering first" with its
-   own web-search tool.
+1. Render OpenAI `tools[]` + `tool_choice` into a `[Client tool calling]`
+   instruction block in `user_message.payload.custom_prompt` — the per-turn
+   instruction channel Quick actually recalls (`system_prompt` content is not
+   recalled; see §5). Also set `web_search_enabled:false` to reduce the model
+   "answering first" with its own web-search tool.
 2. The model emits calls as plain text
    `<function_calls><invoke name="…"><parameter name="…">value</parameter></invoke></function_calls>` (tags may split across
-   `text_delta`s; the plugin does holdback parsing — see `lib/tools.mjs`).
+   `text_delta`s; `src/tools.ts` parses incrementally and holds back partial
+   tags).
 3. Parsed results map to OpenAI `tool_calls` with `finish_reason:"tool_calls"`.
 4. Client returns `role:"tool"` results → rendered as
    `<tool_result tool_use_id="<id>">content</tool_result>` continuing the same thread (the delta
@@ -317,5 +318,5 @@ turn carries only the transcript plus a short instruction. A policy beyond
   events**.
 - The whole `user_message` frame has a 64 KB cap (the server rejects larger
   with `FrameTooLarge`; verified that `text` + `system_prompt` share it),
-  which the plugin budgets in `lib/handler.mjs`/`lib/translate.mjs`/
-  `lib/tools.mjs`; rendered text always stays <60 KB.
+  which the plugin budgets in `src/protocol/frame.ts`/`src/translate.ts`/
+  `src/tools.ts`; rendered text always stays <60 KB.

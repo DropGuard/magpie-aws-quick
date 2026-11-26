@@ -110,7 +110,7 @@ function headerOf(input, init, name) {
   }
 }
 
-/** Stable per-account identity for thread-reuse scoping (hashed, never stored raw). */
+/** Stable per-account identity for thread-reuse matching; persisted in the thread cache. */
 async function identityFor(outpost, fallback) {
   try {
     const s = await outpost.session()

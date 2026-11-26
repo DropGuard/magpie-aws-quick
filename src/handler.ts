@@ -286,7 +286,7 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
             salvage.droppedCall = null
             watchdog.bump()
             options?.log?.(`[aws-quick] dropped ${dc.reason} tool call; asking for a resend (${callTries}/${callMax})`)
-            const retryNote = `[Quick 工具调用重试] 模型的工具调用${dc.reason === 'unterminated' ? '没写完' : ' JSON 不合法'}，正在要求它重发（${callTries}/${callMax}）`
+            const retryNote = `[Quick 工具调用重试] 模型的工具调用${dc.reason === 'unterminated' ? '没写完' : ' 参数格式不正确'}，正在要求它重发（${callTries}/${callMax}）`
             clientText += `\n\n> ${retryNote}`
             yield { type: 'note', text: retryNote }
             continue
