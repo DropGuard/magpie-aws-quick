@@ -149,7 +149,7 @@ export function createSessionStore({ ttlMs = SESSION_DEFAULTS.ttlMs, max = SESSI
      * The thread this request continues: same account and session, stored
      * keys a prefix of `keys`, and a new tail with no assistant message.
      * The match is removed (single-use) so two requests cannot append to one
-     * thread; restore() puts it back if the turn never commits.
+     * thread; restore() puts it back only if the turn failed before sending.
      */
     match({ account, session, keys }: { account: string; session: string; keys: string[] }): ThreadEntry | undefined {
       refresh()
@@ -176,7 +176,7 @@ export function createSessionStore({ ttlMs = SESSION_DEFAULTS.ttlMs, max = SESSI
       evict()
       persist()
     },
-    /** Put a taken entry back after a failed/cancelled turn. */
+    /** Put a taken entry back after a pre-send failure/cancellation. */
     restore(entry: ThreadEntry) {
       if (!threads.has(entry.threadId)) {
         threads.set(entry.threadId, entry)

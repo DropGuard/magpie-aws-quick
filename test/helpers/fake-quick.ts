@@ -215,9 +215,12 @@ export async function startFakeQuick({ script, session, connectError, staleStop 
           const p = inner.payload || {}
           const threadId = p.thread_id || ''
           state.userMessages.push({ threadId, payload: p, at: Date.now() })
-          Promise.resolve(script ? script(p, { threadId }) : defaultScript(p)).then((events) => {
-            const list = Array.isArray(events) ? events : []
-            for (const ev of list) sendEs(ev, threadId || ev.thread_id)
+          Promise.resolve(script ? script(p, { threadId }) : defaultScript(p)).then(async (events) => {
+            const list = Array.isArray(events) || events?.[Symbol.asyncIterator] ? events : []
+            for await (const ev of list) {
+              if (socket.destroyed) break
+              sendEs(ev, threadId || ev.thread_id)
+            }
           }).catch(() => {})
         }
     }

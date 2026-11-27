@@ -49,8 +49,11 @@ export async function primeItems(it: AsyncGenerator<any>, { stream, headerWaitMs
       if (remaining <= 0) break
       let timer: any
       const timedOut = new Promise((res) => { timer = setTimeout(() => res(HDR_WAIT), remaining) })
-      r = await Promise.race([pull(), timedOut])
-      clearTimeout(timer)
+      try {
+        r = await Promise.race([pull(), timedOut])
+      } finally {
+        clearTimeout(timer)
+      }
       if (r === HDR_WAIT) break
     } else {
       r = await pull()
@@ -65,12 +68,16 @@ export async function primeItems(it: AsyncGenerator<any>, { stream, headerWaitMs
     break
   }
   const items = (async function* () {
-    yield* pre
-    if (done) return
-    for (;;) {
-      const r = await pull()
-      if (r.done) return
-      yield r.value
+    try {
+      yield* pre
+      if (done) return
+      for (;;) {
+        const r = await pull()
+        if (r.done) return
+        yield r.value
+      }
+    } finally {
+      await it.return?.(undefined)
     }
   })()
   return { pre, meta, done, items }

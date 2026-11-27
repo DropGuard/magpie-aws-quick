@@ -12,6 +12,8 @@
 // Events observed: session_established, connected, status, message_start,
 // text_delta, thinking_delta, turn_usage, text_complete, message_complete,
 // task_list_update, runs_updated, title_generated, keepalive.
+import { abortable } from './runtime/deadline.ts'
+
 const te = new TextEncoder()
 const td = new TextDecoder()
 
@@ -84,11 +86,28 @@ function wrapEvent(innerJson) {
 export class QuickWsError extends Error {
   code: any
   kind: any
+  status: any
   constructor(message: string, { code, kind, status }: { code?: any; kind?: string; status?: any } = {}) {
     super(message)
     this.name = 'QuickWsError'
     this.code = code
     this.kind = kind || 'ws'
+    this.status = status
+  }
+}
+
+function signalAbortError(signal?: AbortSignal): any {
+  const reason = signal?.reason
+  if (reason && typeof reason === 'object' && 'kind' in reason) return reason
+  return new QuickWsError('aborted', { kind: 'abort', status: 499 })
+}
+
+async function waitAbortable<T>(value: PromiseLike<T> | T, signal?: AbortSignal): Promise<T> {
+  try {
+    return await abortable(value, signal)
+  } catch (error) {
+    if (signal?.aborted) throw signalAbortError(signal)
+    throw error
   }
 }
 
@@ -338,18 +357,18 @@ export class QuickSocket {
    * (message_complete / text_complete / error) or failure.
    * @param {string} threadId
    * @param {object} payload user_message payload fields (text, agent_mode, …)
-   * @param {object} [opts] {signal, onEvent}
+   * @param {object} [opts] {signal, onEvent, onSend}
    */
-  async *turn(threadId: string, payload: any, { signal, onEvent }: { signal?: AbortSignal; onEvent?: (e: any) => void } = {}) {
-    await this.connect()
+  async *turn(threadId: string, payload: any, { signal, onEvent, onSend }: { signal?: AbortSignal; onEvent?: (e: any) => void; onSend?: () => void } = {}) {
+    await waitAbortable(this.connect(), signal)
     // A stop() on this thread may still be flushing the stopped turn's tail;
     // wait for its terminal event (or the timeout) before queueing a new
     // user_message — sending inside that window loses the message.
     const settle = this.settling.get(threadId)
-    if (settle) await settle.promise
-    // cancelled while connecting or settling: don't send a message nobody
-    // will read — its reply tail would land on the thread's next turn
-    if (signal?.aborted) throw new QuickWsError('aborted', { kind: 'abort' })
+    if (settle) await waitAbortable(settle.promise, signal)
+    // Check after all shared waits: a cancelled caller must not send later,
+    // while the socket and other threads remain unaffected.
+    if (signal?.aborted) throw signalAbortError(signal)
     if (this.waiters.has(threadId)) throw new QuickWsError(`thread ${threadId} already has an active turn`, { kind: 'busy' })
     const q: any[] = []
     let failed = null
@@ -372,6 +391,8 @@ export class QuickSocket {
     const onAbort = () => { const n = notify; notify = null; n?.() }
     signal?.addEventListener('abort', onAbort, { once: true })
     try {
+      if (signal?.aborted) throw signalAbortError(signal)
+      onSend?.()
       this.send({ type: 'user_message', payload: { thread_id: threadId, ...payload } })
       for (;;) {
         while (q.length) {
@@ -404,7 +425,7 @@ export class QuickSocket {
             throw new QuickWsError(p.message || p.error || p.reason || `stream ${t}`, { kind: 'stream' })
           }
         }
-        if (signal?.aborted) throw new QuickWsError('aborted', { kind: 'abort' })
+        if (signal?.aborted) throw signalAbortError(signal)
         if (failed) throw failed
         await new Promise((r) => { notify = r })
       }

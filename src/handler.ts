@@ -26,6 +26,9 @@ import { EMPTY_ANSWER_NUDGE, EMPTY_ANSWER_LABEL, EMPTY_ANSWER_ERR, agentNeutral 
 import { errorResponse, errorType, httpStatus, makeId, respondWithItems } from './http/respond.ts'
 import { primeItems } from './http/pump.ts'
 import { nextRetry } from './runtime/retry.ts'
+import { createCallScope, abortable } from './runtime/deadline.ts'
+import type { CallScope } from './runtime/deadline.ts'
+import { classifyRequest } from './request-context.ts'
 import {
   AGENT_MODES, MODELS, modeFor, effortFor, capEffort, lowerEffort, textOf, byteLen,
 } from './translate.ts'
@@ -118,14 +121,19 @@ export function resetQuotaWindows() { quotaWindows.clear(); quotaRefresh.clear()
 const turnLanes = new Map<string, Promise<void>>()
 const LANE_WAIT_MS = 8_000
 
-async function holdTurnLane(key: string) {
+async function holdTurnLane(key: string, signal?: AbortSignal) {
+  signal?.throwIfAborted()
   if (!key) return () => {}
   const prev = turnLanes.get(key)
   if (prev) {
     let timer: any
-    await Promise.race([prev, new Promise<void>((resolve) => { timer = setTimeout(resolve, LANE_WAIT_MS); timer.unref?.() })])
-    clearTimeout(timer)
+    try {
+      await abortable(Promise.race([prev, new Promise<void>((resolve) => { timer = setTimeout(resolve, LANE_WAIT_MS); timer.unref?.() })]), signal)
+    } finally {
+      clearTimeout(timer)
+    }
   }
+  signal?.throwIfAborted()
   let resolve!: () => void
   const held = new Promise<void>((r) => { resolve = r })
   turnLanes.set(key, held)
@@ -164,6 +172,13 @@ async function socketFor(outpost, options) {
 }
 
 
+function releaseReview(review) {
+  const slot = review?.slot
+  if (!slot) return
+  review.slot = undefined
+  slot.inflight = Math.max(0, slot.inflight - 1)
+}
+
 /**
  * Normalized turn output:
  *   {type:'meta', threadId, reused, mode}
@@ -174,95 +189,92 @@ async function socketFor(outpost, options) {
  *   {type:'note', text}                 non-fatal oddities worth showing
  *   {type:'done', …}                    terminal bookkeeping
  */
-async function* runTurn({ outpost, socket, body, systemText, base, review, sessions, options, signal }) {
+async function* runTurn({ outpost, socket, body, systemText, base, review, sessions, options, signal, scope }) {
   const mode = base.agent_mode
   if (review) {
     // Reviews are one-shot even when Magpie supplied the main chat's session ID.
     try {
-      const result = await readReview(socket, review, signal, msOpt(options?.idleTimeoutMs, 300_000))
+      const result = await scope.wait(readReview(socket, review, signal, msOpt(options?.idleTimeoutMs, 300_000)))
+      scope.check()
       yield { type: 'meta', threadId: review.threadId, reused: false, mode }
       for (const u of result.usage) yield { type: 'usage', usage: usageFrom(u) }
       yield { type: 'text', text: result.text }
     } finally {
       // A primed review thread goes back to the pool for the next check.
-      if (review.slot) review.slot.inflight = Math.max(0, review.slot.inflight - 1)
+      releaseReview(review)
     }
     return
   }
   const ctx = buildTurnContext({ body, outpost, sessions, options, signal, systemText, base })
   const { convo, tools, identity, sessionKey, taken, reuse, canonClientTool, showQuickTools } = ctx
   let threadId = reuse ? reuse.entry.threadId : crypto.randomUUID()
-  const first = await composeAttempt(ctx, { threadId, reuse })
-  let payload = first.payload
-  let toolNames = first.toolNames
-  let reused = first.reused
-
-  const state: StreamState = { text: '', reasoning: '', usage: null, calls: [] }
-  // Client-tool calls salvaged from Quick's native channel this turn
-  // ({name, arguments} — arguments already JSON). Quick discards the stopped
-  // step server-side, so the session entry carries these and the NEXT reused
-  // turn re-states them before the tool results (composeAttempt's reuse branch).
-  const salvage: Salvage = { salvageCalls: [], droppedCall: null }
-  const consumeOpts = { tools, canonClientTool, showQuickTools, contextWindowCap: Number(options?.contextWindow) > 0 ? Number(options.contextWindow) : 1_000_000 }
-
-  yield { type: 'meta', threadId, reused, mode }
-  // What the client will store as this assistant message: text chunks and
-  // notes, in stream order. Thread reuse hashes our reply against the client's
-  // history, so a note left out here breaks the chain on the NEXT turn and
-  // every note would start a new thread (subagents did exactly that).
-  let clientText = ''
-  // The attempt's note is yielded before the turn loop, so it must also be
-  // added to the client-visible text here — the reply we hash has to match
-  // what the client stores, or the next turn starts a new thread.
-  if (first.note) {
-    clientText += `\n\n> ${first.note}`
-    yield { type: 'note', text: first.note }
-  }
-
-  // Quick's own stop message (the frame the desktop sends on stop): socket.stop
-  // sends it AND arms the per-thread settle window, so the next turn() on this
-  // thread waits out Quick's stale terminal-event tail instead of losing its
-  // user_message. Covers watchdog timeout, client abort and tool salvage.
+  let sent = false
+  let committed = false
+  let stage = 'compose'
+  let disposeWatchdog = () => {}
+  const stopped = new Set<string>()
   const stopTurn = (tid: string) => {
+    if (stopped.has(tid)) return
+    stopped.add(tid)
     try { socket.stop(tid) } catch {}
   }
-  const watchdog = createWatchdog({ idleMs: msOpt(options?.idleTimeoutMs, 300_000), signal })
-  const consumeHooks = {
-    onProgress: () => watchdog.bump(),
-    // stopGeneration + abort: the turn signal wakes the parked socket.turn
-    // waiter so closing the generator can't hang on a silent Quick.
-    onSalvageStop: () => { stopTurn(threadId); watchdog.abort() },
-  }
-
-  const produced = () => state.text.length > 0 || state.calls.length > 0 || state.reasoning.length > 0
-  let turnOk = false
-  // A guardrail stop ends the turn with no answer at all (measured: those
-  // replies carry usage 0/0). Retry it here, before the client is handed the
-  // canned sentence — the user's alternative was typing "continue" by hand.
-  // Bounded, same account, and `guardrailRetries: 0` turns it off.
-  const guardMax = Math.max(0, Math.floor(msOpt(options?.guardrailRetries, 1)))
-  let guardTries = 0
-  // Reasoning-only turns: Quick finishes normally with thinking and no text
-  // and no call. The client stores an empty assistant message, shows
-  // "Thought for Ns", and waits for the user. Retrying this by default would
-  // buy another multi-minute silence, not correctness — so the default is to
-  // fail loudly and let the caller decide (`answerRetries` opts into a retry,
-  // same thread, one effort level lower).
-  const answerMax = Math.max(0, Math.floor(msOpt(options?.answerRetries, 0)))
-  let answerTries = 0
-  // A malformed <invoke> is a protocol failure, not an answer: retry it
-  // inside this request before the client sees the placeholder error. The
-  // observed failure was two "No such tool available" errors in a row for a
-  // Bash call whose JSON had unescaped quotes.
-  const callMax = Math.max(0, Math.floor(msOpt(options?.callRetries, 1)))
-  let callTries = 0
-  // A fresh-thread retry is the last attempt: failures from it surface as-is
-  // (the old inline copy did exactly that — no guardrail loop on the retry).
-  let freshTried = false
   try {
+    const first = await scope.wait(composeAttempt(ctx, { threadId, reuse }))
+    scope.check()
+    options?.log?.(`[aws-quick] turn purpose=${options?.requestPurpose ?? 'main'} source=${options?.requestSource ?? 'default'} thread=${threadId} reused=${!!reuse} reason=${options?.requestIsolated ? 'background-isolated' : reuse ? 'prefix-match' : sessions ? 'cache-miss' : 'cache-disabled'}`)
+    let payload = first.payload
+    let toolNames = first.toolNames
+    let reused = first.reused
+
+    const state: StreamState = { text: '', reasoning: '', usage: null, calls: [] }
+    // Client-tool calls salvaged from Quick's native channel this turn
+    // ({name, arguments} — arguments already JSON). Quick discards the stopped
+    // step server-side, so the session entry carries these and the NEXT reused
+    // turn re-states them before the tool results (composeAttempt's reuse branch).
+    const salvage: Salvage = { salvageCalls: [], droppedCall: null }
+    const consumeOpts = { tools, canonClientTool, showQuickTools, contextWindowCap: Number(options?.contextWindow) > 0 ? Number(options.contextWindow) : 1_000_000 }
+
+    yield { type: 'meta', threadId, reused, mode }
+    // Notes are client-visible output, emitted before the generation loop.
+    let clientText = ''
+    if (first.note) {
+      clientText += `\n\n> ${first.note}`
+      yield { type: 'note', text: first.note }
+    }
+
+    // stop_generation also arms the per-thread settle window: the next turn
+    // waits out Quick's stale terminal-event tail instead of losing its message.
+    const watchdog = createWatchdog({ idleMs: msOpt(options?.idleTimeoutMs, 300_000), signal })
+    disposeWatchdog = () => watchdog.dispose()
+    const consumeHooks = {
+      onProgress: () => watchdog.bump(),
+      // Wake a parked socket.turn waiter after native client-tool salvage.
+      onSalvageStop: () => { stopTurn(threadId); watchdog.abort() },
+    }
+
+    const produced = () => state.text.length > 0 || state.calls.length > 0 || state.reasoning.length > 0
+    // Each retry family retains its own policy, but all share maxAttempts.
+    const guardMax = Math.max(0, Math.floor(msOpt(options?.guardrailRetries, 1)))
+    let guardTries = 0
+    // Reasoning-only turns fail loudly unless answerRetries opts into a retry
+    // (same thread, one effort level lower).
+    const answerMax = Math.max(0, Math.floor(msOpt(options?.answerRetries, 0)))
+    let answerTries = 0
+    // Ask again for a malformed invoke before emitting a placeholder call.
+    const callMax = Math.max(0, Math.floor(msOpt(options?.callRetries, 1)))
+    let callTries = 0
+    // A fresh-thread retry is the last attempt; its failures surface as-is.
+    let freshTried = false
+    const maxAttempts = Math.max(1, Math.floor(msOpt(options?.maxTurnAttempts, 3)))
+    let attempts = 0
     for (;;) {
+      stage = 'generation'
+      scope.check()
+      attempts++
+      options?.log?.(`[aws-quick] attempt=${attempts}/${maxAttempts} thread=${threadId} remainingMs=${Math.ceil(scope.remainingMs())}`)
       try {
-        for await (const o of consumeTurn(socket.turn(threadId, payload, { signal: watchdog.signal }), threadId, state, salvage, consumeOpts, consumeHooks)) {
+        for await (const o of consumeTurn(socket.turn(threadId, payload, { signal: watchdog.signal, onSend: () => { sent = true } }), threadId, state, salvage, consumeOpts, consumeHooks)) {
+          scope.check()
           if (o.type === 'text') clientText += o.text
           else if (o.type === 'note') clientText += `\n\n> ${o.text}`
           yield o
@@ -274,7 +286,7 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
         // to resend it here, on the same thread, before giving up.
         if (salvage.droppedCall) {
           const dc = salvage.droppedCall
-          if (!state.text && !state.calls.length && callTries < callMax && !signal?.aborted) {
+          if (!state.text && !state.calls.length && callTries < callMax && attempts < maxAttempts && !signal?.aborted) {
             callTries++
             const nudge = dc.reason === 'unterminated'
               ? `Your previous <invoke>${dc.name ? ` for ${dc.name}` : ''} ended before </invoke>, so the client never ran it. Resend it as a complete invoke block; if the content is long, split it into several smaller calls.`
@@ -295,7 +307,6 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
             if (item.type === 'note') clientText += `\n\n> ${item.text}`
             yield item
           }
-          turnOk = true
           break
         }
         // The wire turn ended, but only reasoning arrived. From the client's
@@ -311,7 +322,7 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
           // and answerTries each cap at 1 here.
           const coupled = guardTries > 0 && answerTries === 0 ? 1 : 0
           const answerBudget = Math.max(answerMax, coupled)
-          if (answerTries < answerBudget) {
+          if (answerTries < answerBudget && attempts < maxAttempts) {
             answerTries++
             const original = String(payload.text ?? '')
             const nudged = `${original}\n\n${EMPTY_ANSWER_NUDGE}`
@@ -328,13 +339,15 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
           }
           throw new QuickWsError(EMPTY_ANSWER_ERR, { kind: 'empty' })
         }
-        turnOk = true
+        scope.check()
         break
       } catch (e) {
         const term = watchdog.termination(e, threadId, stopTurn)
         if (term) throw term
-        if (freshTried) throw e
+        scope.check()
+        if (freshTried || attempts >= maxAttempts) throw e
         const action = nextRetry({ guardTries, guardMax, reused: !!(reuse && sessions), produced: produced() }, e)
+        options?.log?.(`[aws-quick] retry action=${action.type} kind=${e?.kind ?? 'unknown'} status=${httpStatus(e)} attempt=${attempts}/${maxAttempts}`)
         if (action.type === 'guardrail-retry') {
           guardTries++
           // Keep what the model was asked to answer. On a fresh thread
@@ -362,7 +375,10 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
         // again — exactly what composeAttempt's retry mode assembles.
         const fresh = crypto.randomUUID()
         taken.length = 0 // the cached thread is the dead one — nothing to put back
-        const second = await composeAttempt(ctx, { threadId: fresh, reuse: null, retry: true })
+        if (sent) stopTurn(threadId)
+        stage = 'recompose'
+        const second = await scope.wait(composeAttempt(ctx, { threadId: fresh, reuse: null, retry: true }))
+        scope.check()
         state.text = ''
         state.reasoning = ''
         state.usage = null
@@ -378,17 +394,26 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
         if (second.note) { clientText += `\n\n> ${second.note}`; yield { type: 'note', text: second.note } }
       }
     }
+    // Commit only a completed turn that still belongs to a live caller. A stop
+    // frame does not roll server history back, so a sent-but-failed turn must
+    // not put the old prefix back into the reusable pool.
+    stage = 'commit'
+    scope.check()
+    if (sessions && (state.text || state.calls.length)) {
+      rememberTurn({ sessions, convo, identity, sessionKey, threadId, toolNames, salvage })
+    } else if (sessions && !sent) restoreTaken(sessions, taken)
+    taken.length = 0
+    committed = true
+    yield { type: 'done', threadId, text: state.text, reasoning: state.reasoning, usage: state.usage }
   } finally {
-    watchdog.dispose()
-    // errors, watchdog and client cancels (generator return) all land here
-    if (!turnOk && sessions) restoreTaken(sessions, taken)
+    disposeWatchdog()
+    if (!committed) {
+      if (sent) stopTurn(threadId)
+      if (sessions && !sent) restoreTaken(sessions, taken)
+      else taken.length = 0
+      options?.log?.(`[aws-quick] turn failed stage=${stage} kind=${scope.signal.reason?.kind ?? 'unknown'} thread=${threadId} cache=${sent ? 'invalidated-after-send' : 'restored-before-send'}`)
+    }
   }
-
-  // Remember where this conversation stands for the next request.
-  if (sessions && (state.text || state.calls.length)) {
-    rememberTurn({ sessions, convo, identity, sessionKey, threadId, toolNames, salvage })
-  } else if (sessions) restoreTaken(sessions, taken)
-  yield { type: 'done', threadId, text: state.text, reasoning: state.reasoning, usage: state.usage }
 }
 
 /**
@@ -400,7 +425,21 @@ async function* runTurn({ outpost, socket, body, systemText, base, review, sessi
  * @param {string} [p.effortHeader] X-Magpie-Effort style header value
  * @param {AbortSignal} [p.signal]
  */
-export async function handleChatCompletions({ body, outpostMgr, sessions, options, effortHeader, signal }) {
+export async function handleChatCompletions(args) {
+  const scope: CallScope = args.callScope ?? createCallScope({ signal: args.signal, timeoutMs: msOpt(args.options?.requestTimeoutMs, 600_000) })
+  try {
+    scope.check()
+    const response = await handleRequest({ ...args, signal: scope.signal, scope })
+    if (!response.headers.get('content-type')?.startsWith('text/event-stream')) scope.dispose()
+    return response
+  } catch (error) {
+    const e = scope.normalize(error)
+    scope.dispose()
+    return errorResponse(httpStatus(e), e?.message ?? String(e), errorType(e))
+  }
+}
+
+async function handleRequest({ body, outpostMgr, sessions, options, effortHeader, signal, scope }) {
   if (!body || typeof body !== 'object') return errorResponse(400, 'request body must be JSON', 'invalid_request_error')
   if (!Array.isArray(body.messages) || !body.messages.length) {
     return errorResponse(400, 'messages is required', 'invalid_request_error')
@@ -408,6 +447,9 @@ export async function handleChatCompletions({ body, outpostMgr, sessions, option
   if (body.messages.some(m => !m || typeof m !== 'object')) {
     return errorResponse(400, 'each message must be an object', 'invalid_request_error')
   }
+  const request = classifyRequest(body, options)
+  options = { ...options, sessionKey: request.sessionKey, requestPurpose: request.purpose, requestSource: request.source, requestIsolated: request.isolated }
+  if (request.isolated) sessions = undefined
   const model = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : 'smart'
   const messages = body.messages
   const systemText = agentNeutral(messages.filter(m => m.role === 'system' || m.role === 'developer').map(m => textOf(m.content)).join('\n\n'))
@@ -448,22 +490,26 @@ export async function handleChatCompletions({ body, outpostMgr, sessions, option
   }
   let outpost
   try {
-    outpost = await outpostMgr.ensure()
+    outpost = await scope.wait(outpostMgr.ensure())
   } catch (e) {
     return errorResponse(httpStatus(e), e?.message ?? String(e), errorType(e))
   }
   let socket
   try {
-    socket = await socketFor(outpost, { ...options, effortHeader, log: options?.log })
+    socket = await scope.wait(socketFor(outpost, { ...options, effortHeader, log: options?.log }))
   } catch (e) {
     return errorResponse(httpStatus(e), e?.message ?? String(e), errorType(e))
   }
   if (review?.prime) {
     // The policy exceeded one frame: prime it into a dedicated thread's
     // history (a few plain turns), then review on that thread.
+    const materializing = materializeReview(socket, review, base, signal)
     try {
-      review = await materializeReview(socket, review, base, signal)
+      review = await scope.wait(materializing)
     } catch (e) {
+      // Cancellation may win after the pool granted a slot but before its
+      // result reached this caller. Return that late lease instead of losing it.
+      void materializing.then(releaseReview, () => {})
       return errorResponse(httpStatus(e), e?.message ?? String(e), errorType(e))
     }
   }
@@ -475,9 +521,15 @@ export async function handleChatCompletions({ body, outpostMgr, sessions, option
   // Acquire BEFORE runTurn: buildTurnContext (the thread match) runs on the
   // first pull. Release via respondWithItems' onSettled, which fires after the
   // stream ends — by then rememberTurn has committed this turn's entry.
-  const laneKey = !review && options?.sessionKey ? `${identity}|${options.sessionKey}` : ''
-  const releaseLane = await holdTurnLane(laneKey)
-  const it = runTurn({ outpost, socket, body, systemText, base, review, sessions, options, signal })
+  const laneKey = !review && !request.isolated && options?.sessionKey ? `${identity}|${options.sessionKey}` : ''
+  let releaseLane
+  try {
+    releaseLane = await holdTurnLane(laneKey, signal)
+  } catch (error) {
+    releaseReview(review)
+    throw error
+  }
+  const it = runTurn({ outpost, socket, body, systemText, base, review, sessions, options, signal, scope })
 
   // Pull up to the first real output before answering so auth/session failures
   // surface as real HTTP statuses (magpie marks the account on 401, fails over
@@ -488,8 +540,13 @@ export async function handleChatCompletions({ body, outpostMgr, sessions, option
       stream: !!body.stream,
       headerWaitMs: msOpt(options?.headerWaitMs, 10_000),
     })
-  } catch (e) {
+    scope.check()
+  } catch (error) {
+    // Every pending turn wait observes the scope. Finish its finally block
+    // before allowing the next request to acquire this conversation's lane.
+    await it.return?.().catch(() => {})
     releaseLane()
+    const e = scope.normalize(error)
     noteQuota(e)
     return errorResponse(httpStatus(e), e?.message ?? String(e), errorType(e))
   }
@@ -503,8 +560,13 @@ export async function handleChatCompletions({ body, outpostMgr, sessions, option
     stream: !!body.stream,
     includeUsage: !!body.stream_options?.include_usage,
     onError: noteQuota,
-    onCancel: () => { items.return?.(); it.return?.() },
-    onSettled: releaseLane,
+    normalizeError: (error) => scope.normalize(error),
+    onCancel: async () => {
+      scope.abort()
+      await items.return?.().catch(() => {})
+      await it.return?.().catch(() => {})
+    },
+    onSettled: () => { releaseLane(); scope.dispose() },
   })
 }
 

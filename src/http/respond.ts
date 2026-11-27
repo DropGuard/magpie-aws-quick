@@ -42,6 +42,10 @@ export function makeId(threadId: string | undefined) {
 
 const EMPTY_USAGE = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
 
+function normalizeFailure(opts: RespondOptions, error: any) {
+  try { return opts.normalizeError?.(error) ?? error } catch { return error }
+}
+
 export interface RespondOptions {
   id: string
   created: number
@@ -51,8 +55,10 @@ export interface RespondOptions {
   includeUsage: boolean
   /** A failed turn: the caller records quota bookkeeping, then we answer. */
   onError: (e: any) => void
-  /** The client went away while streaming: abandon both generators. */
-  onCancel: () => void
+  /** The client went away while streaming: abort and clean up both generators. */
+  onCancel: () => void | Promise<void>
+  /** Normalize call-scope cancellation/deadline errors before mapping them to HTTP/SSE. */
+  normalizeError?: (e: any) => any
   /** The turn is over (success, error or cancel): release the conversation lane. */
   onSettled?: () => void
 }
@@ -60,6 +66,12 @@ export interface RespondOptions {
 /** Render the turn's items as chat.completion (or an SSE stream). */
 export async function respondWithItems(items: AsyncIterable<TurnItem>, opts: RespondOptions): Promise<Response> {
   const { id, created, model } = opts
+  let settled = false
+  const settleOnce = () => {
+    if (settled) return
+    settled = true
+    opts.onSettled?.()
+  }
   if (!opts.stream) {
     let text = ''
     let reasoning = ''
@@ -78,10 +90,11 @@ export async function respondWithItems(items: AsyncIterable<TurnItem>, opts: Res
         else if (o.type === 'usage') usage = addUsage(usage, o.usage)
       }
     } catch (e) {
-      opts.onError(e)
-      return errorResponse(httpStatus(e), e?.message ?? String(e), errorType(e))
+      const error = normalizeFailure(opts, e)
+      try { opts.onError(error) } catch {}
+      return errorResponse(httpStatus(error), error?.message ?? String(error), errorType(error))
     } finally {
-      opts.onSettled?.()
+      settleOnce()
     }
     const message: any = { role: 'assistant', content: text }
     if (reasoning) message.reasoning_content = reasoning
@@ -97,9 +110,16 @@ export async function respondWithItems(items: AsyncIterable<TurnItem>, opts: Res
   }
 
   const enc = new TextEncoder()
+  let cancelled = false
+  let cancelCleanup: Promise<void> | null = null
   const stream = new ReadableStream({
     async start(controller) {
-      const send = (obj: any) => controller.enqueue(enc.encode(`data: ${JSON.stringify(obj)}\n\n`))
+      const send = (obj: any) => {
+        if (!cancelled) controller.enqueue(enc.encode(`data: ${JSON.stringify(obj)}\n\n`))
+      }
+      const sendDone = () => {
+        if (!cancelled) controller.enqueue(enc.encode('data: [DONE]\n\n'))
+      }
       const chunk = (delta: any, finish: string | null = null) => send({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta, finish_reason: finish }] })
       let sentRole = false
       const role = () => {
@@ -130,19 +150,31 @@ export async function respondWithItems(items: AsyncIterable<TurnItem>, opts: Res
         role()
         chunk({}, toolIndex > 0 ? 'tool_calls' : 'stop')
         if (opts.includeUsage) send({ id, object: 'chat.completion.chunk', created, model, choices: [], usage: usage ?? EMPTY_USAGE })
-        controller.enqueue(enc.encode('data: [DONE]\n\n'))
+        sendDone()
       } catch (e) {
-        // A mid-stream failure cannot become an HTTP status: the client sees
-        // an OpenAI-shaped error frame instead (quota bookkeeping already ran
-        // before the stream started).
-        send({ error: { message: e?.message ?? String(e), type: errorType(e), code: httpStatus(e) } })
-        controller.enqueue(enc.encode('data: [DONE]\n\n'))
+        const error = normalizeFailure(opts, e)
+        // A mid-stream failure cannot become an HTTP status; report it to
+        // bookkeeping and, unless the client cancelled, emit an error frame.
+        try { opts.onError(error) } catch {}
+        if (!cancelled) {
+          send({ error: { message: error?.message ?? String(error), type: errorType(error), code: httpStatus(error) } })
+          sendDone()
+        }
       } finally {
-        controller.close()
-        opts.onSettled?.()
+        if (cancelCleanup) {
+          try { await cancelCleanup } catch {}
+        }
+        if (!cancelled) controller.close()
+        settleOnce()
       }
     },
-    cancel() { opts.onCancel(); opts.onSettled?.() },
+    cancel() {
+      if (cancelled) return cancelCleanup ?? undefined
+      cancelled = true
+      try { cancelCleanup = Promise.resolve(opts.onCancel()) }
+      catch (error) { cancelCleanup = Promise.reject(error) }
+      return cancelCleanup
+    },
   })
   return new Response(stream, {
     status: 200,

@@ -21,6 +21,7 @@ import {
 } from '../translate.ts'
 import type { RenderStats } from '../translate.ts'
 import { resolveReuse } from './reuse.ts'
+import { restoreTaken } from './session.ts'
 import type { ThreadEntry } from '../sessions.ts'
 import type { Reuse } from './reuse.ts'
 import { pickTurnImages, createAttachmentFlow, CONTEXT_ATTACHED_NOTE, TOO_LONG_ERR, TOOL_UPLOAD_MIN } from './attachments.ts'
@@ -163,50 +164,51 @@ export function buildTurnContext({ body, outpost, sessions, options, signal, sys
 
   const identity = options?.identity || 'local'
   const { reuse, taken } = resolveReuse({ sessions, identity, convo, sessionKey })
-  // The tool spec is the disposable part of the frame: the caller's message
-  // (with AGENTS.md and the memory index inside its <system-reminder>) must
-  // arrive whole, so the spec compresses first — descriptions before schemas,
-  // and only as far as the room requires. protocol/frame.ts owns the ladder.
-  const fitPreamble = (list: any[] = tools, need = 0) => {
-    const picked = pickPreamble({ tools: list, toolChoice: body.tool_choice, room: roomForTools, need })
-    if (picked.concession) {
-      mark('preamble')
-      stats.specTier = picked.tier
+  try {
+    // The caller's message must arrive whole, so the tool spec compresses first.
+    // protocol/frame.ts owns the ladder: descriptions before schemas.
+    const fitPreamble = (list: any[] = tools, need = 0) => {
+      const picked = pickPreamble({ tools: list, toolChoice: body.tool_choice, room: roomForTools, need })
+      if (picked.concession) {
+        mark('preamble')
+        stats.specTier = picked.tier
+      }
+      return picked.preamble
     }
-    return picked.preamble
-  }
-  // Bytes the current message needs beside the preamble (its injected
-  // instructions included), capped at what a turn may take.
-  const currentTurnNeed = Math.min(byteLen(textOf(convo.at(-1)?.content ?? '')), 20 * 1024) + 256
-  // What this thread will have seen once this turn lands.
-  const known = reuse?.entry?.toolNames ? new Set(reuse.entry.toolNames) : null
-  const added = reuse ? tools.filter((t) => !known?.has(t.name)) : []
-  const toolsCustom = !tools.length ? ''
-    : !reuse ? fitPreamble(tools, currentTurnNeed)
-      : added.length ? fitPreamble(added) : ''
-  // The old bridge appended this short reminder to each user message, where
-  // the model reads it last; the full spec rides in custom_prompt.
-  const toolsReminder = tools.length ? buildToolPreamble(tools, body.tool_choice, { reminder: true }) : ''
-  const toolNames = [...new Set([...(reuse ? known ?? [] : []), ...tools.map((t) => t.name)])]
-  // protocol/frame.ts owns every byte of this arithmetic.
-  const textCap = frameRoom({ systemText, customPrompt: [customPrompt, toolsCustom].filter(Boolean).join('\n\n') })
-  const textBudget = Math.max(4 * 1024, textCap - byteLen(toolsReminder))
+    // Bytes the current message needs beside the preamble (its injected
+    // instructions included), capped at what a turn may take.
+    const currentTurnNeed = Math.min(byteLen(textOf(convo.at(-1)?.content ?? '')), 20 * 1024) + 256
+    // What this thread will have seen once this turn lands.
+    const known = reuse?.entry?.toolNames ? new Set(reuse.entry.toolNames) : null
+    const added = reuse ? tools.filter((t) => !known?.has(t.name)) : []
+    const toolsCustom = !tools.length ? ''
+      : !reuse ? fitPreamble(tools, currentTurnNeed)
+        : added.length ? fitPreamble(added) : ''
+    // The short reminder rides in text; the full spec rides in custom_prompt.
+    const toolsReminder = tools.length ? buildToolPreamble(tools, body.tool_choice, { reminder: true }) : ''
+    const toolNames = [...new Set([...(reuse ? known ?? [] : []), ...tools.map((t) => t.name)])]
+    // protocol/frame.ts owns every byte of this arithmetic.
+    const textCap = frameRoom({ systemText, customPrompt: [customPrompt, toolsCustom].filter(Boolean).join('\n\n') })
+    const textBudget = Math.max(4 * 1024, textCap - byteLen(toolsReminder))
 
-  // Images ride user_message.attachments: small ones inline as base64 inside
-  // the frame; larger ones go through Quick's cloud attachment upload
-  // (attachments.ts) on every backend. Only this turn's images are sent;
-  // inline bytes shrink the text budget, uploaded ones don't.
-  const images = pickTurnImages({ convo, reuse, textBudget })
-  const turnBudget = textBudget - images.bytes
-  const frameCap = textCap - images.bytes
-  const { imageNoteFor, uploadAll, attachContext, attachPointer, uploadToolResult } = createAttachmentFlow({ outpost, options, signal, convo, images })
+    // Only this turn's images are sent; inline bytes shrink the text budget,
+    // uploaded ones don't.
+    const images = pickTurnImages({ convo, reuse, textBudget })
+    const turnBudget = textBudget - images.bytes
+    const frameCap = textCap - images.bytes
+    const { imageNoteFor, uploadAll, attachContext, attachPointer, uploadToolResult } = createAttachmentFlow({ outpost, options, signal, convo, images })
 
-  return {
-    convo, tools, mode,
-    systemText, base, customPrompt, toolsCustom, toolsReminder, textCap, textBudget, turnBudget, frameCap,
-    identity, sessionKey, reuse, taken, stats, mark, mergeStats, fitPreamble,
-    uploadAll, attachContext, attachPointer, uploadToolResult, imageNoteFor, currentTurnNeed,
-    canonClientTool, showQuickTools, images, toolNames, options, signal,
+    return {
+      convo, tools, mode,
+      systemText, base, customPrompt, toolsCustom, toolsReminder, textCap, textBudget, turnBudget, frameCap,
+      identity, sessionKey, reuse, taken, stats, mark, mergeStats, fitPreamble,
+      uploadAll, attachContext, attachPointer, uploadToolResult, imageNoteFor, currentTurnNeed,
+      canonClientTool, showQuickTools, images, toolNames, options, signal,
+    }
+  } catch (error) {
+    // The caller cannot recover a lease if planning throws before returning it.
+    if (sessions) restoreTaken(sessions, taken)
+    throw error
   }
 }
 

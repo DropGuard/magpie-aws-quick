@@ -63,8 +63,11 @@ export function createAttachmentFlow({ outpost, options, signal, convo, images }
   // Failures degrade to the not-delivered note; aborts propagate.
   const uploadAll = async (tid: string) => {
     if (!images.toUpload.length) return { entries: [] as any[], failed: 0 }
+    signal?.throwIfAborted()
     const sess = await outpost.session()
+    signal?.throwIfAborted()
     const devId = await Promise.resolve(outpost.outpostId?.()).catch(() => '')
+    signal?.throwIfAborted()
     const results = await Promise.allSettled(images.toUpload.map((img) =>
       uploadImage({
         session: sess, image: img, name: img.name, threadId: tid, outpostId: devId || undefined,
@@ -108,8 +111,11 @@ export function createAttachmentFlow({ outpost, options, signal, convo, images }
       throw Object.assign(new Error(`conversation is ${bytes.length} bytes, over the ${MAX_CONTEXT_ATTACHMENT}-byte attachment cap`), { reason: 'size' })
     }
     const name = `context_${crypto.randomUUID().slice(0, 8)}.txt`
+    signal?.throwIfAborted()
     const sess = await outpost.session()
+    signal?.throwIfAborted()
     const devId = await Promise.resolve(outpost.outpostId?.()).catch(() => '')
+    signal?.throwIfAborted()
     const entry = await uploadFile({
       session: sess,
       name,
@@ -138,8 +144,11 @@ export function createAttachmentFlow({ outpost, options, signal, convo, images }
   // the truncation the caller already rendered.
   const uploadToolResult = async (tid: string, name: string, text: string) => {
     try {
+      signal?.throwIfAborted()
       const sess = await outpost.session()
+      signal?.throwIfAborted()
       const devId = await Promise.resolve(outpost.outpostId?.()).catch(() => '')
+      signal?.throwIfAborted()
       return await uploadFile({
         session: sess, name, mimeType: 'text/plain', bytes: Buffer.from(text, 'utf8'),
         threadId: tid, outpostId: devId || undefined,

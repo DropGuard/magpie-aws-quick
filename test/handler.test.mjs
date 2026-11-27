@@ -1302,7 +1302,7 @@ test('<sources> citations are stripped; a broken <invoke> is reported and restat
   }
 })
 
-test('a reused turn cancelled by the client puts the thread back for the next request', async () => {
+test('a reused turn cancelled after sending invalidates the old thread for the next request', async () => {
   let calls = 0
   const f = await startFakeQuick({
     script: (p) => {
@@ -1325,14 +1325,16 @@ test('a reused turn cancelled by the client puts the thread back for the next re
     ac.abort()
     assert.equal((await p2).status, 499)
 
-    // client retries the same request: it must land on the original thread
+    // Quick may already have appended the user turn; stop does not roll it back.
     const r3 = await handleChatCompletions({ body: { model: 'fast', messages: convo2 }, outpostMgr: mgr, sessions, options: opts })
     assert.equal(r3.status, 200)
     await r3.json()
     const [t1, t2, t3] = f.state.userMessages.slice(-3)
     assert.equal(t2.threadId, t1.threadId)
-    assert.equal(t3.threadId, t1.threadId, 'cancelled turn must not strand the thread')
-    assert.equal(t3.payload.text, 'what color?')
+    assert.notEqual(t3.threadId, t1.threadId, 'a sent-but-cancelled thread must not be reused with a stale prefix')
+    assert.match(t3.payload.text, /remember teal/)
+    assert.match(t3.payload.text, /what color\?/)
+    assert.ok(f.state.stopGenerations.some((p) => p.thread_id === t1.threadId))
   } finally {
     await f.close()
   }

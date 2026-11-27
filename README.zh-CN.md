@@ -67,7 +67,7 @@ Quick 在服务端按 `thread_id` 保存会话历史，而 OpenAI 客户端每�
   通配符 `assistant`。客户端重发它自己渲染的回复（裁剪、附加 note、重新生成
   调用 id、丢掉 thinking）仍然命中；命中时只把新增的 user/tool 尾部发给上游，
   更早的历史由 Quick 服务端保存。
-- **只有历史本身变了才换 thread** —— 编辑、回退或 compaction 改写了某条
+- **历史变化就换 thread** —— 编辑、回退或 compaction 改写了某条
   user/tool 消息，它的 key 就变了，已存前缀不再匹配，插件新建 thread 并重发
   当前 transcript。继续旧 thread 就是让模型基于客户端早已压缩掉的 500k token
   历史工作。新尾部里出现 assistant 消息的请求同样不匹配：客户端手里的历史比
@@ -75,9 +75,17 @@ Quick 在服务端按 `thread_id` 保存会话历史，而 OpenAI 客户端每�
 - **thread 身份只看账号、网关会话键和消息前缀** —— system prompt、agent_mode、
   工具列表、思考强度都不参与。Claude Code 会在会话中途改 system prompt
   （memory、billing、ToolSearch）或换模型档位，这些变化不该丢掉 thread。
-- **命中即取走** —— 匹配成功会把条目从缓存里移除，两个请求不可能同时往一个
-  thread 里追加；这一轮出错或被取消（499、内容过滤、空闲超时）时再放回去，
-  下一次请求照样续接。
+- **后台 fork 与子代理分开** —— 已知的 Claude Code 下一步建议、离开总结和标题
+  请求使用一次性 Quick thread，不取走或提交共享会话缓存，也不等待主会话的 lane。
+  普通 `x-magpie-subagent` 分支使用独立分区，仍可多轮复用。已知用途的
+  `query_source`/`querySource` 请求元数据或显式 `x-magpie-query-source` 适配头
+  优先；该头是适配约定，不代表所有网关都已透传。无元数据时只识别当前请求中
+  严格的 Claude 提示词特征，不靠短消息、没工具或历史引用猜测。客户端提示词
+  改版后，可能需要更新识别规则或显式提供元数据。
+- **命中即取走** —— 匹配成功会把条目从缓存里移除。发送前的准备失败可以归还；
+  一旦可能已经发送 `user_message`，取消、超时或状态不确定的失败就使旧前缀失效，
+  下一次请求安全新建 thread。Quick 的 `stop_generation` 只是尽力停止，
+  不会回滚服务端历史。
 - **有界内存** —— 条目空闲 24 小时过期，LRU 上限 200 个 thread。缓存持久化到
   `thread-sessions.json`（账号身份、会话键、消息 key 哈希、thread id 和工具名，
   无消息内容），插件重载后仍可续接。
@@ -137,6 +145,9 @@ magpie login aws-quick              # 按提示选择登录方式
 供不走 magpie 的客户端使用，或通过
 `magpie provider add --base-url http://127.0.0.1:3426/v1` 把 Quick 作为
 自定义 provider 接入。参数见文件头（建议设置 `PROXY_TOKEN` 鉴权）。
+`QUICK_REQUEST_TIMEOUT_MS` 设置同一个固定请求总预算（`0` 关闭），
+`QUICK_MAX_TURN_ATTEMPTS` 设置共享生成次数上限。代理与插件使用相同的规则读取
+会话、子代理、思考强度和显式用途适配头。
 
 **两种登录方式**
 
@@ -174,9 +185,16 @@ magpie login aws-quick              # 按提示选择登录方式
 - `headerWaitMs`（默认 `10000`）：流式请求在 Quick 给出首个输出**或**超过
   该时长后返回响应头——Quick 跑自带工具时可能长时间静默，而网关对响应头
   的等待是有上限的。`0` 表示和以前一样等到首个输出。
-- `idleTimeoutMs`（默认 `300000`）：一轮 Quick turn 超过该时长没有任何进展
-  （keepalive 不算）就中止，报 503 `timeout`；同时给 Quick 发它自己的
-  `stop_generation` 帧，避免服务端继续空跑。客户端中止同样处理。`0` 关闭。
+- `requestTimeoutMs`（默认 `600000`，10 分钟）：单次插件/代理调用的固定总预算，
+  从读取 body、准备后端和账号身份之前开始，覆盖上传、review、建连等待、生成
+  及内部重试；有进展也不会重置。`0` 显式关闭。SSE 响应头发出前到期报 HTTP 503；
+  发出后用 code 为 503 的 SSE error 加 `[DONE]` 结束。客户端取消单独记为 499。
+- `idleTimeoutMs`（默认 `300000`）：生成期间该时长没有 Quick 进展
+  （keepalive 不算）就以 503 `timeout` 中止；它与固定总期限相互独立，`0`
+  只关闭这个空闲 watchdog。发送后取消或超时会尽力给该 thread 发
+  `stop_generation`，不关闭其他线程共用的 socket。
+- `maxTurnAttempts`（默认 `3`，最少 `1`）：审核、坏工具调用、空回答及新线程重试
+  共用的生成尝试次数上限。调大下面某一项重试选项，也不能突破该上限或总期限。
 - `showQuickTools`（默认 `true`）：把 Quick 自带工具的 `tool_start` 以
   `[Quick: <名称>]` 推理行的形式透出，长时间 agentic 轮次不再看起来像卡死；
   `false` 隐藏。
@@ -205,6 +223,14 @@ magpie login aws-quick              # 按提示选择登录方式
 请换一个浏览器，或者用无痕窗口登录另一个账号，不要在浏览器里退出已经添加的账号。
 
 ## 已知限制
+
+- **总期限只覆盖单次调用，不覆盖网关整条重试链。** Magpie 可以再次调用插件或
+  换账号，各次调用分别计时。取消只中断当前调用的等待，不会停止其他调用仍需的
+  共享认证刷新或建连。JavaScript 定时器不能抢占同步工作：本地 agent 冷启动
+  的 ZIP 解压使用同步子进程，有独立的 10 分钟上限；控制权返回后才检查已到期
+  的 scope。因此事件循环阻塞时不能保证严格墙钟上限，但过期调用不能继续生成
+  或提交可复用线程。预算约束提供方的工作，直到生成流实际结束；不包含提供方
+  已完成后，慢客户端仍在等待的下游网络发送。
 
 - **用量超限转为 429，并快速故障转移。** Quick 同时执行滚动 session
   桶（每个时间窗内的代理运行分钟数）和月度桶。账号用尽时，运行时有时
@@ -237,7 +263,7 @@ magpie login aws-quick              # 按提示选择登录方式
   `ws_host`（已实测）。
 - **采样参数**：`temperature` 等不在协议内，传了也会被服务端忽略（`capabilities.temperature:false`）。
 - **会话与账号绑定**：只有账号身份和网关会话键都相同时才会续接 thread；换号后旧 thread 自动失效重建。
-- **多窗口/并发**：同一 QuickSocket 上不同 thread 可并行 turn。同一会话的请求会先等上一轮结束（有上限），所以中断后立刻追问仍会续接同一 thread；如果两个请求仍同时落到一个 thread 上，第二个会被拒绝（`busy`）。
+- **多窗口/并发**：同一 QuickSocket 上不同 thread 可并行 turn。同一会话的请求会短暂等待上一轮的缓存提交或取消清理（有上限）。如果上一轮在发送后取消，下一次请求会新建 thread，不再复用旧前缀；如果两个请求仍同时落到一个 thread 上，第二个会被拒绝（`busy`）。
 - **消息体积**：整个 `user_message` 帧服务端上限 64KB（`text` 与
   指令及附件共享）。超大 system prompt / 工具 schema / 会话历史会自动
   压缩（schema 去注解、工具规格 lite→仅名字降级、tool_result 封顶）。整段对话装不进

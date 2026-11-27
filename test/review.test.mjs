@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import { handleChatCompletions } from '../src/handler.ts'
 import { startFakeQuick } from './helpers/fake-quick.ts'
 import { createSessionStore } from '../src/sessions.ts'
+import { materializeReview, prepareReview } from '../src/review.ts'
+import { createCallScope } from '../src/runtime/deadline.ts'
 import { frameBytes, UPSTREAM_TEXT_LIMIT } from '../src/translate.ts'
 
 const schema = 'You are a security monitor for autonomous AI coding agents.\nApply the application policy. Report the result in a <block> field.'
@@ -75,6 +77,77 @@ test('a second review with the same policy reuses the primed thread', async () =
     assert.ok(msgs.every((m) => m.threadId === msgs[0].threadId))
     assert.equal(msgs.filter((m) => m.payload.text.startsWith('<<<SECURITY POLICY')).length, 2)
   } finally { await f.close() }
+})
+
+async function warmReviewPool(policy) {
+  const plan = prepareReview(reviewBody(policy).messages, policy, {}, crypto.randomUUID())
+  assert.ok(plan.prime)
+  const socket = { async *turn() { yield { type: 'message_complete', payload: { text: 'stored' } } } }
+  const reviews = await Promise.all(Array.from({ length: 4 }, () => materializeReview(socket, plan, {})))
+  assert.equal(new Set(reviews.map((review) => review.threadId)).size, 4)
+  return reviews.map((review) => review.slot)
+}
+
+test('cancelled review materialization returns late leases instead of exhausting the pool', { timeout: 5_000 }, async () => {
+  const policy = schema + '\nlate-materialization-fixture\n' + 'R'.repeat(70 * 1024)
+  const slots = await warmReviewPool(policy)
+  for (const slot of slots) slot.inflight--
+  const f = await startFakeQuick({ script: () => done('<block>no</block>') })
+  try {
+    const outpostMgr = manager(f)
+    for (let n = 0; n < 4; n++) {
+      const scope = createCallScope({ timeoutMs: 1_000 })
+      const wait = scope.wait.bind(scope)
+      let waits = 0
+      scope.wait = (work) => {
+        const pending = wait(work)
+        // ensure, socket, then materialization: cancel after acquiring a slot
+        // but before its async result can be delivered to the handler.
+        if (++waits === 3) scope.abort()
+        return pending
+      }
+      try {
+        const response = await handleChatCompletions({ body: reviewBody(policy), outpostMgr, callScope: scope })
+        assert.equal(response.status, 499)
+        await response.json()
+        assert.equal(waits, 3)
+        await new Promise((resolve) => setImmediate(resolve))
+        assert.deepEqual(slots.map((slot) => slot.inflight), [0, 0, 0, 0])
+        assert.equal(f.state.userMessages.length, 0, 'cancelled review must not send')
+      } finally { scope.dispose() }
+    }
+    const response = await handleChatCompletions({ body: reviewBody(policy), outpostMgr })
+    assert.equal(response.status, 200, 'a healthy review still has an available lease')
+    assert.equal((await response.json()).choices[0].message.content, '<block>no</block>')
+    assert.equal(f.state.userMessages.length, 1)
+    assert.deepEqual(slots.map((slot) => slot.inflight), [0, 0, 0, 0])
+  } finally { await f.close() }
+})
+
+test('cancellation before review handoff releases only its own lease', { timeout: 5_000 }, async () => {
+  const policy = schema + '\nreview-handoff-fixture\n' + 'H'.repeat(70 * 1024)
+  const slots = await warmReviewPool(policy)
+  slots[0].inflight--
+  const f = await startFakeQuick({ script: () => done('<block>no</block>') })
+  const scope = createCallScope({ timeoutMs: 1_000 })
+  const wait = scope.wait.bind(scope)
+  let handoffs = 0
+  scope.wait = (work) => wait(work).then((result) => {
+    if (result?.slot) { handoffs++; scope.abort() }
+    return result
+  })
+  try {
+    const response = await handleChatCompletions({ body: reviewBody(policy), outpostMgr: manager(f), callScope: scope })
+    assert.equal(response.status, 499)
+    await response.json()
+    assert.equal(handoffs, 1, 'must cancel after a primed lease was received')
+    assert.equal(f.state.userMessages.length, 0)
+    assert.deepEqual(slots.map((slot) => slot.inflight), [0, 1, 1, 1], 'other reviews retain their leases')
+  } finally {
+    scope.dispose()
+    for (const slot of slots) slot.inflight = 0
+    await f.close()
+  }
 })
 
 test('an oversized transcript is middle-capped while the policy stays complete', async () => {

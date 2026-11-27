@@ -82,7 +82,7 @@ decision:
   rendering of our reply (trimming, notes, regenerated ids, dropped thinking)
   therefore still matches. A hit sends only the new user/tool tail upstream;
   Quick's server-side history supplies the rest.
-- **A new thread only when history itself changed** — an edited, rewound or
+- **Changed history starts a new thread** — an edited, rewound or
   compacted user/tool message changes its key, so the stored prefix stops
   matching and the plugin starts a fresh thread with the transcript it now has.
   Continuing the old thread is how a model ends up working from a 500k-token
@@ -93,10 +93,21 @@ decision:
   prompt, agent mode, tool list and thinking effort are not part of it. Claude
   Code changes its own system prompt mid-session (memory, billing, ToolSearch)
   or switches model tier; that must not discard the thread.
-- **A match is single-use** — taking an entry removes it from the store, so two
-  requests cannot append to one thread. A reused turn that errors or is
-  cancelled (499, content filter, idle timeout) puts its thread back, so the
-  next request continues it.
+- **Background forks and subagents are separate** — the known Claude Code
+  suggestion, away-summary and title requests use one-shot Quick threads and
+  never take or commit the shared conversation cache or wait on its turn lane.
+  Ordinary `x-magpie-subagent` branches retain multi-turn reuse in their own
+  partition. Known `query_source`/`querySource` request metadata or an explicit
+  `x-magpie-query-source` adapter header take precedence; the header is an
+  adapter convention, not something every gateway is known to send. Without
+  metadata, only the current, strict Claude prompt signatures are recognized;
+  short text, missing tools and historical quotations are not enough. Changed
+  client prompts may require a classifier update or explicit metadata.
+- **A match is single-use** — taking an entry removes it from the store. A
+  preparation failure before sending restores it; once `user_message` may
+  have been sent, cancellation, timeout or an uncertain failure invalidates
+  the old prefix. The next request safely starts a new thread. Quick's
+  `stop_generation` is best effort, not a rollback of server history.
 - **Bounded memory** — entries expire after 24h idle and the store is
   LRU-capped at 200 threads. The cache persists to `thread-sessions.json`
   (account identity, session key, message-key hashes, thread ids and tool
@@ -165,6 +176,10 @@ serves the same adapter on `127.0.0.1:$PORT/v1` (default port 3426) for
 clients that don't go through magpie, or to add Quick as a custom magpie
 provider via `magpie provider add --base-url http://127.0.0.1:3426/v1`.
 See the file header for options (`PROXY_TOKEN` auth recommended).
+`QUICK_REQUEST_TIMEOUT_MS` sets the same fixed request budget (`0` disables);
+`QUICK_MAX_TURN_ATTEMPTS` sets the shared generation-attempt cap. The proxy
+also reads session, subagent, effort and explicit query-source adapter headers
+using the same rules as the plugin.
 
 **Sign-in methods**
 
@@ -206,11 +221,21 @@ A few plugin options tune request handling (`magpie plugin options aws-quick '{�
   after Quick's first output **or** this long, whichever comes first — Quick
   can sit silent while its own tools run, and gateways cap how long they wait
   for headers. `0` waits for the first output as before.
-- `idleTimeoutMs` (default `300000`): abort a turn that shows no Quick progress
-  (real events; keepalives don't count) for this long — surfaces as a 503
-  `timeout` error, and Quick gets its own `stop_generation` frame so the turn
-  doesn't keep running server-side. Client aborts are handled the same way.
-  `0` disables the watchdog.
+- `requestTimeoutMs` (default `600000`, 10 minutes): fixed total budget for
+  one plugin/proxy call, starting before body parsing and backend/identity
+  preparation and covering uploads, review, connection waits, generation and
+  internal retries. Progress does not reset it. `0` explicitly disables it.
+  Before SSE headers, expiry is HTTP 503; afterwards it is an SSE error with
+  code 503 followed by `[DONE]`. Client cancellation is distinct: 499.
+- `idleTimeoutMs` (default `300000`): abort a generation turn with no Quick
+  progress (keepalives don't count) for this long, with a 503 `timeout`.
+  This is separate from the fixed request deadline. `0` disables only this
+  watchdog. Cancellation/timeout after sending triggers best-effort
+  `stop_generation` for that thread, without closing the shared socket.
+- `maxTurnAttempts` (default `3`, minimum `1`): shared generation-attempt cap
+  across guardrail, malformed-call, empty-answer and fresh-thread retries.
+  Raising an individual retry option below cannot exceed this cap or the
+  request deadline.
 - `showQuickTools` (default `true`): surface Quick's built-in tool activity
   (`tool_start`) as `[Quick: <name>]` reasoning lines so long agentic turns
   don't look dead; `false` hides them.
@@ -242,6 +267,18 @@ the plugin can no longer refresh it. Sign in each account in a different
 browser or in a private/incognito window, without signing out of the others.
 
 ## Known limitations
+
+- **The deadline covers one invocation, not the gateway's whole retry chain.**
+  Magpie can invoke the plugin again or switch accounts; those calls have
+  separate budgets. Request cancellation interrupts this caller's wait, not
+  shared authentication refresh or connection work needed by other callers.
+  JavaScript timers cannot preempt synchronous work: cold local-agent ZIP
+  extraction uses a synchronous child process with its own 10-minute limit;
+  the expired scope is checked when control returns. A blocked event loop is
+  therefore not a strict wall-clock guarantee. No expired caller is allowed
+  to proceed to generation or commit a reusable thread. The budget bounds
+  provider work through generation-stream settlement, not a slow client's
+  final network drain after the provider has finished.
 
 - **Usage limits become 429s, with fast failover.** Quick enforces a rolling
   session bucket (minutes of agent time per window) plus a monthly bucket.
@@ -289,7 +326,8 @@ browser or in a private/incognito window, without signing out of the others.
   invalidates old threads.
 - **Concurrency**: different threads can run turns in parallel on one
   QuickSocket. Requests for the same conversation wait briefly for the previous
-  turn (so a fast follow-up after an interrupt continues the same thread); if
+  turn's cache commit or cancellation cleanup. If that turn was cancelled after
+  sending, the next request starts fresh rather than reusing its old prefix. If
   two requests still reach one thread at once, the second is rejected (`busy`).
 - **OAuth sign-in is consumer/social only**: it replays the desktop app's
   `quick.aws.com/sn` flow (`social` provider). Enterprise-IdP tenants whose

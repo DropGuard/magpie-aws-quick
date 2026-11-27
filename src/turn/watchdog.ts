@@ -31,29 +31,46 @@ export interface Watchdog {
 
 export function createWatchdog({ idleMs, signal }: { idleMs: number; signal?: AbortSignal }): Watchdog {
   const ctl = new AbortController()
-  const linkRequestAbort = () => ctl.abort()
+  let fired = false
+  let salvaged = false
+  let timer: any = null
+  const clearTimer = () => {
+    if (timer !== null) { clearTimeout(timer); timer = null }
+  }
+  const linkRequestAbort = () => {
+    clearTimer()
+    ctl.abort(signal?.reason)
+  }
   if (signal) {
-    if (signal.aborted) ctl.abort()
+    if (signal.aborted) linkRequestAbort()
     else signal.addEventListener('abort', linkRequestAbort, { once: true })
   }
-  let fired = false
-  let timer: any = null
   const bump = () => {
-    if (!idleMs) return
-    if (timer) clearTimeout(timer)
-    timer = setTimeout(() => { fired = true; ctl.abort() }, idleMs)
+    if (!idleMs || ctl.signal.aborted) return
+    clearTimer()
+    timer = setTimeout(() => { timer = null; fired = true; ctl.abort() }, idleMs)
     timer.unref?.()
   }
   bump()
   return {
     signal: ctl.signal,
     bump,
-    abort: () => ctl.abort(),
+    abort: () => {
+      if (ctl.signal.aborted) return
+      salvaged = true
+      clearTimer()
+      ctl.abort(new QuickWsError('turn stopped for salvage', { kind: 'salvage' }))
+    },
     termination(e, tid, stop) {
+      if (signal?.aborted && (signal as any).reason?.kind === 'timeout') {
+        stop(tid)
+        return (signal as any).reason
+      }
       if (fired) {
         stop(tid)
         return new QuickWsError(`Quick 已 ${idleMs / 1000}s 没有进展，已中止本轮 (idleTimeoutMs)`, { kind: 'timeout' })
       }
+      if (salvaged) return null
       if (signal?.aborted || e?.kind === 'abort') {
         stop(tid)
         return e
@@ -61,7 +78,7 @@ export function createWatchdog({ idleMs, signal }: { idleMs: number; signal?: Ab
       return null
     },
     dispose() {
-      if (timer) clearTimeout(timer)
+      clearTimer()
       signal?.removeEventListener?.('abort', linkRequestAbort)
     },
   }

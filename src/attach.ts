@@ -112,6 +112,7 @@ async function uploadFileInner({ session, name, mimeType = 'application/octet-st
 
   // 1. raw bytes → attachmentId
   let r
+  signal?.throwIfAborted()
   try {
     r = await fetchImpl(`${base}upload-attachment?` + new URLSearchParams({
       name: String(name || 'file'), contentType: mimeType, contentLength: String(data.length),
@@ -134,6 +135,7 @@ async function uploadFileInner({ session, name, mimeType = 'application/octet-st
   // 2. wait for the DLP scan; only an explicit ALLOW lets the file through
   let cleared = false
   for (let i = 0; i < maxPolls; i++) {
+    signal?.throwIfAborted()
     try {
       r = await fetchImpl(`${base}attachment-dlp-status?attachmentId=${encodeURIComponent(attachmentId)}`, { headers, signal })
     } catch (e: any) {
@@ -169,6 +171,7 @@ async function uploadFileInner({ session, name, mimeType = 'application/octet-st
       outpostId: outpostId || crypto.randomUUID(),
     } },
   }
+  signal?.throwIfAborted()
   try {
     r = await fetchImpl(`${base}qbs-event`, {
       method: 'POST',

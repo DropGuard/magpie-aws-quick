@@ -29,7 +29,8 @@
  *   surfaceType  WS surfaceType (default QUICK_WORK_DESKTOP_WINDOWS)
  *   appVersion   WS appVersion (default 1.2.4660)
  *   channel      WS channel hint (beta|prod)
- *   sessionReuse continue Quick threads across turns (default true)
+ *   sessionReuse continue Quick threads across turns (default true); known background helpers bypass reuse
+ *                x-magpie-subagent partitions reusable branches; x-magpie-query-source is an explicit adapter hint
  *   sessionTtlMs forget a cached thread state after this long unused (default 86400000 = 24h)
  *   sessionMax   at most this many cached thread states (default 200)
  *   sessionDir   where OAuth sessions are stored (default: platform config dir)
@@ -37,6 +38,8 @@
  *   oauthTimeoutMs how long to wait for the browser login (default 600000)
  *   headerWaitMs  streaming: send headers after this long even before first output (default 10000; 0 = wait for output)
  *   idleTimeoutMs abort a turn with no Quick progress for this long (default 300000; 0 = off); keepalives don't count
+ *   requestTimeoutMs fixed budget for one call, including preparation and retries (default 600000; 0 = off)
+ *   maxTurnAttempts shared cap across generation retry types (default 3; minimum 1)
  *   showQuickTools surface Quick's own tool_start events as [Quick: name] reasoning lines (default true)
  *   stableDeviceId direct sessions send a stable per-account device id as outpostId, like the desktop (default true; false = empty)
  *   contextAttachments  a fresh thread's transcript that cannot fit one 64 KB frame is uploaded as a text attachment the model reads (default true; false = fail that turn with 400 so the client compacts its own history)
@@ -63,6 +66,9 @@ import {
 } from './oauth.ts'
 import { createCredManBackend, loadCredManSession, credManDeviceId } from './credman.ts'
 import { quickUsage } from './usage.ts'
+import { requestOptions } from './request-context.ts'
+import { createCallScope, abortable } from './runtime/deadline.ts'
+import { errorResponse, errorType, httpStatus } from './http/respond.ts'
 
 const PROVIDER = 'aws-quick'
 // Requests never reach this address: the loader's fetch intercepts them.
@@ -93,9 +99,32 @@ function requestUrl(input) {
   }
 }
 
-async function readBody(input, init) {
+async function readBody(input, init, signal?: AbortSignal) {
   let raw = init?.body
-  if (raw == null && input instanceof Request) raw = await input.text()
+  if (raw == null && input instanceof Request) {
+    signal?.throwIfAborted()
+    raw = ''
+    if (input.body) {
+      const reader = input.body.getReader()
+      const decoder = new TextDecoder()
+      const onAbort = () => { void reader.cancel(signal?.reason).catch(() => {}) }
+      signal?.addEventListener('abort', onAbort, { once: true })
+      try {
+        signal?.throwIfAborted()
+        for (;;) {
+          const part = await abortable(reader.read(), signal)
+          signal?.throwIfAborted()
+          if (part.done) break
+          raw += decoder.decode(part.value, { stream: true })
+        }
+        raw += decoder.decode()
+      } finally {
+        signal?.removeEventListener('abort', onAbort)
+        if (signal?.aborted) onAbort()
+        reader.releaseLock()
+      }
+    }
+  }
   if (raw instanceof Uint8Array || raw instanceof ArrayBuffer) raw = new TextDecoder().decode(raw)
   if (typeof raw !== 'string') raw = raw == null ? '' : String(raw)
   return JSON.parse(raw || '{}')
@@ -133,32 +162,45 @@ function makeFetch(outpostMgr, opts, sessions) {
         headers: { 'content-type': 'application/json' },
       })
     }
-    let body
-    try {
-      body = await readBody(input, init)
-    } catch {
-      return new Response(JSON.stringify({ error: { message: 'request body must be JSON', type: 'invalid_request_error' } }), { status: 400, headers: { 'content-type': 'application/json' } })
-    }
-    const outpost = await outpostMgr.ensure().catch((e) => ({ __err: e }))
-    if (outpost?.__err) {
-      const e = outpost.__err
-      return new Response(JSON.stringify({ error: { message: e?.message ?? String(e), type: 'api_error', code: 503 } }), { status: 503, headers: { 'content-type': 'application/json' } })
-    }
-    const identity = await identityFor(outpost, opts.identityKey || 'aws-quick')
-    // magpie stamps every request of a chat session with x-magpie-session;
-    // other agents (pi) send their own affinity headers. Captured for the
-    // session-keyed thread-reuse fallback.
-    const sessionKey = ['x-magpie-session', 'session_id', 'x-session-id', 'x-session-affinity', 'x-client-request-id', 'x-thread-id', 'x-conversation-id']
-      .map((n) => headerOf(input, init, n))
-      .find((v) => typeof v === 'string' && v.trim())
-    return handleChatCompletions({
-      body,
-      outpostMgr,
-      sessions,
-      options: { ...opts, identity, sessionKey },
-      effortHeader: headerOf(input, init, 'x-magpie-effort'),
-      signal: init?.signal,
+    const configured = opts.requestTimeoutMs
+    const timeoutMs = configured == null || configured === '' || !Number.isFinite(Number(configured)) ? 600_000 : Number(configured)
+    const scope = createCallScope({
+      signal: init?.signal ?? (input instanceof Request ? input.signal : undefined),
+      timeoutMs,
     })
+    let stage = 'request-body'
+    try {
+      scope.check()
+      let body
+      try {
+        body = await scope.wait(readBody(input, init, scope.signal))
+      } catch (error) {
+        scope.check()
+        scope.dispose()
+        return errorResponse(400, 'request body must be JSON', 'invalid_request_error')
+      }
+      stage = 'backend'
+      const outpost = await scope.wait(outpostMgr.ensure())
+      stage = 'identity'
+      const identity = await scope.wait(identityFor(outpost, opts.identityKey || 'aws-quick'))
+      scope.check()
+      const request = requestOptions((name) => headerOf(input, init, name))
+      // The handler owns the scope until the actual response stream settles.
+      stage = 'handler'
+      return await handleChatCompletions({
+        body,
+        outpostMgr,
+        sessions,
+        options: { ...opts, ...request, identity },
+        effortHeader: request.effortHeader,
+        callScope: scope,
+      })
+    } catch (error) {
+      const e = scope.normalize(error)
+      opts.log?.(`[aws-quick] request failed stage=${stage} kind=${e?.kind ?? 'unknown'} status=${httpStatus(e)}`)
+      scope.dispose()
+      return errorResponse(httpStatus(e), e?.message ?? String(e), errorType(e))
+    }
   }
 }
 

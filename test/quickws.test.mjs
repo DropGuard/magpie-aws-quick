@@ -127,3 +127,73 @@ test('status events carrying only payload.thread_id reach their own thread, not 
     await f.close()
   }
 })
+
+test('abort during shared connect prevents only that thread from sending', async () => {
+  const f = await startFakeQuick()
+  const socket = socketFor(f)
+  const realConnect = socket.connect.bind(socket)
+  let releaseConnect
+  const sharedConnect = new Promise((resolve) => { releaseConnect = resolve }).then(() => realConnect())
+  socket.connect = () => sharedConnect
+  const cancelledThread = crypto.randomUUID()
+  const activeThread = crypto.randomUUID()
+  const ac = new AbortController()
+  let cancelledOnSend = 0
+  let activeOnSend = 0
+  const cancelledTurn = (async () => {
+    for await (const _ of socket.turn(cancelledThread, { text: 'cancelled' }, { signal: ac.signal, onSend: () => cancelledOnSend++ })) {}
+  })()
+  const activeTurn = (async () => {
+    for await (const _ of socket.turn(activeThread, { text: 'active' }, { onSend: () => activeOnSend++ })) {}
+  })()
+
+  ac.abort()
+  await assert.rejects(cancelledTurn, (error) => error.kind === 'abort')
+  releaseConnect()
+  try {
+    await activeTurn
+    await sleep(20)
+    assert.equal(cancelledOnSend, 0)
+    assert.equal(activeOnSend, 1)
+    assert.deepEqual(f.state.userMessages.map((message) => message.threadId), [activeThread])
+  } finally {
+    await socket.close()
+    await f.close()
+  }
+})
+
+test('abort during one thread settle wait does not affect another thread or send late', async () => {
+  const f = await startFakeQuick()
+  const socket = socketFor(f)
+  await socket.connect()
+  const settlingThread = crypto.randomUUID()
+  const activeThread = crypto.randomUUID()
+  let releaseSettle
+  const settlePromise = new Promise((resolve) => { releaseSettle = resolve })
+  socket.settling.set(settlingThread, { promise: settlePromise, resolve: releaseSettle, timer: setTimeout(() => {}, 30_000) })
+  const ac = new AbortController()
+  let cancelledOnSend = 0
+  let activeOnSend = 0
+  const cancelledTurn = (async () => {
+    for await (const _ of socket.turn(settlingThread, { text: 'cancelled' }, { signal: ac.signal, onSend: () => cancelledOnSend++ })) {}
+  })()
+  const activeTurn = (async () => {
+    for await (const _ of socket.turn(activeThread, { text: 'active' }, { onSend: () => activeOnSend++ })) {}
+  })()
+
+  ac.abort()
+  try {
+    await assert.rejects(cancelledTurn, (error) => error.kind === 'abort')
+    await activeTurn
+    releaseSettle()
+    await sleep(20)
+    assert.equal(cancelledOnSend, 0)
+    assert.equal(activeOnSend, 1)
+    assert.deepEqual(f.state.userMessages.map((message) => message.threadId), [activeThread])
+  } finally {
+    clearTimeout(socket.settling.get(settlingThread)?.timer)
+    socket._settleDone(settlingThread)
+    await socket.close()
+    await f.close()
+  }
+})
