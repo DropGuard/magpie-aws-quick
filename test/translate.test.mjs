@@ -1,6 +1,19 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { textOf, modeFor, effortFor, capEffort, lowerEffort, renderTranscript, renderDelta, byteLen, capText, UPSTREAM_TEXT_LIMIT, imagesOf, pickImages, MAX_UPLOAD_IMAGE_BYTES, MAX_UPLOADS, MAX_UPLOAD_TOTAL_BYTES } from '../src/translate.ts'
+import { textOf, modeFor, effortFor, capEffort, lowerEffort, renderTranscript, renderDelta, byteLen, escapedBytes, capText, capMiddle, UPSTREAM_TEXT_LIMIT, imagesOf, pickImages, MAX_UPLOAD_IMAGE_BYTES, MAX_UPLOADS, MAX_UPLOAD_TOTAL_BYTES } from '../src/translate.ts'
+
+test('capMiddle can fit encoded frame bytes without losing the request ending or splitting Unicode', () => {
+  const text = 'REQUEST-HEAD\n' + '"\\\n步骤😀'.repeat(3000) + '\nREQUEST-TAIL'
+  for (const cap of [0, 400, 1200, 4096, 12000]) {
+    const cut = capMiddle(text, cap, escapedBytes)
+    assert.ok(escapedBytes(cut) <= cap, `${escapedBytes(cut)} encoded bytes within ${cap}`)
+    assert.ok(cut.isWellFormed(), 'Unicode characters are not split')
+    if (cap >= 1200) {
+      assert.ok(cut.startsWith('REQUEST-HEAD'))
+      assert.ok(cut.endsWith('REQUEST-TAIL'))
+    }
+  }
+})
 
 test('textOf handles strings, parts arrays, and junk', () => {
   assert.equal(textOf('hi'), 'hi')

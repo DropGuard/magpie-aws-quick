@@ -3,17 +3,16 @@
 // Images ride user_message.attachments — small ones inline as base64 inside the
 // frame, larger ones through Quick's cloud attachment upload. When a fresh
 // thread's transcript does not fit one frame, the conversation is uploaded as
-// a text file and the frame keeps a pointer plus the newest message (silently
-// cutting the middle is what made the model "forget" the task).
+// a text file; the frame keeps the current request, bounded source excerpts
+// and a lookup pointer (silently cutting history made the model "forget").
 import crypto from 'node:crypto'
 import { uploadFile, uploadImage } from '../attach.ts'
-import { renderTranscript, textOf, byteLen, canonRole, pickImages } from '../translate.ts'
+import { renderTranscript, textOf, byteLen, escapedBytes, capMiddle, canonRole, pickImages } from '../translate.ts'
 
 // A transcript that cannot fit one 64 KB frame travels as a cloud attachment
 // (the desktop upload flow takes text files). Refuse absurd sizes rather than
 // pushing gigabytes at the upload endpoint.
 const MAX_CONTEXT_ATTACHMENT = 32 * 1024 * 1024
-export const CONTEXT_ATTACHED_NOTE = '上下文超过 Quick 64KB 单帧上限，已把最后一条消息之前的对话作为附件传给 Quick（模型会先读取该文件）'
 export const TOO_LONG_ERR = "context_length_exceeded: the conversation does not fit Amazon Quick's 64 KB message limit and uploading it as a context attachment failed"
 // Text room kept free when inline images claim the frame.
 const IMAGE_TEXT_RESERVE = 8 * 1024
@@ -24,6 +23,19 @@ const IMAGE_TEXT_RESERVE = 8 * 1024
  *  the frame. */
 export const TOOL_UPLOAD_MIN = 8 * 1024
 const TOOL_UPLOADS_PER_TURN = 2
+
+function requestText(content: any): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content.filter((part) => ['text', 'input_text', 'output_text'].includes(part?.type) && typeof part.text === 'string')
+    .map((part) => part.text).join('\n')
+}
+
+export interface ContextAttachment {
+  entry: any
+  request: string
+  latestTool: string
+}
 
 /**
  * Split this turn's images into inline / upload / skipped, against the text
@@ -41,9 +53,9 @@ export interface AttachmentFlow {
   /** Deliver the queued uploads into tid's cloud workspace, in parallel. */
   uploadAll: (tid: string) => Promise<{ entries: any[]; failed: number }>
   /** Upload the conversation as a text file (null when disabled). */
-  attachContext: (tid: string) => Promise<any>
-  /** Pointer text for a transcript replaced by the attachment, plus the newest message. */
-  attachPointer: (attachment: any) => string
+  attachContext: (tid: string, history?: any[]) => Promise<ContextAttachment | null>
+  /** Pointer and current request; optional excerpts never resize that request. */
+  attachPointer: (attachment: ContextAttachment, maxBytes: number, excerpts?: string) => string
   /** Upload one oversized tool result; null when it could not be delivered. */
   uploadToolResult: (tid: string, name: string, text: string) => Promise<any | null>
 }
@@ -90,22 +102,18 @@ export function createAttachmentFlow({ outpost, options, signal, convo, images }
   // transcript does not fit, silently dropping its middle is what makes the
   // model "forget" the task and re-read everything each turn, so send the
   // conversation as a cloud attachment instead (the desktop flow takes text
-  // files; the model's own file tool reads the workspace path) and keep only a
-  // pointer plus the newest message in the frame. Attaching is best-effort:
-  // when it fails the turn errors out, so the client compacts its own history
-  // instead of working from a gutted transcript — a silent cut is the worse
-  // failure (the old bridge behaved this way and stayed usable).
-  const attachContext = async (tid: string) => {
+  // files; the model's own file tool reads the workspace path). The frame keeps
+  // the current request and small source hints, not a mandatory full-file read.
+  // Upload failure errors out so the client can compact rather than silently
+  // working from a gutted transcript.
+  const attachContext = async (tid: string, history = convo) => {
     if (options?.contextAttachments === false) return null
-    // The old bridge uploads the conversation UP TO the last message and keeps
-    // that last message in the frame (when it is short). The model reads the
-    // whole file before acting, so nothing is lost and the current turn is
-    // still visible without a file read.
-    const lastMsg = convo.at(-1)
-    const lastText = lastMsg ? textOf(lastMsg.content) : ''
-    const keepLast = convo.length > 1 && byteLen(lastText) <= 6000
-    const older = keepLast ? convo.slice(0, -1) : convo
-    const full = renderTranscript(older, '', { lossless: true })
+    const lastMsg = history.at(-1)
+    const user = history.findLast((m) => canonRole(m.role) === 'user')
+    const request = user ? requestText(user.content) : ''
+    // Cloud metadata is known only after uploading. Keep the current request
+    // archived too, so fitting its inline preview later cannot lose content.
+    const full = renderTranscript(history, '', { lossless: true })
     const bytes = Buffer.from(full, 'utf8')
     if (bytes.length > MAX_CONTEXT_ATTACHMENT) {
       throw Object.assign(new Error(`conversation is ${bytes.length} bytes, over the ${MAX_CONTEXT_ATTACHMENT}-byte attachment cap`), { reason: 'size' })
@@ -129,15 +137,28 @@ export function createAttachmentFlow({ outpost, options, signal, convo, images }
       // compacts) rather than waiting for the idle watchdog
       timeoutMs: Number(options?.contextUploadTimeoutMs) > 0 ? Number(options.contextUploadTimeoutMs) : 120_000,
     })
-    return { entry, last: keepLast ? lastText : '' }
+    const latestTool = canonRole(lastMsg?.role) === 'tool' || lastMsg?.role === 'function'
+      ? renderTranscript([lastMsg], '', { lossless: true }) : ''
+    return { entry, request, latestTool }
   }
-  // Pointer text: the conversation up to the last message is in the file; the
-  // last message itself rides in the frame when it was short enough.
-  const attachPointer = (attachment: any) => {
-    const entry = attachment?.entry ?? attachment
-    const last = String(attachment?.last ?? '')
-    const lead = `[The conversation up to the last message is in the attached file ${entry.name} (${entry.size} bytes) because it is too long to send here. Read the whole file with your file tool before anything else, then carry on from it exactly as if its text had been sent in this message. Do not mention the file or that you are reading it.]`
-    return last ? `${lead}\n\n${last}` : lead
+  const attachPointer = (attachment: ContextAttachment, maxBytes: number, excerpts = '') => {
+    const { entry, request, latestTool } = attachment
+    const lead = `[The full conversation is in the attached file ${entry.name} (${entry.size} bytes) because it is too long to send here. Continue from the current request and any continuation excerpts below. Consult the file with Quick's file tool only when specific information is missing; locate the relevant passages rather than reading the whole transcript by default.]`
+    let room = Math.max(0, maxBytes - escapedBytes(lead) - 4)
+    const current: string[] = []
+    if (request) {
+      let label = '[Latest user request]'
+      if (escapedBytes(label + '\n' + request) > room) label = '[Latest user request preview — full text is in the transcript attachment]'
+      const body = capMiddle(request, Math.max(0, room - escapedBytes(label) - 2), escapedBytes)
+      current.push(`${label}\n${body}`)
+      room -= escapedBytes(current[0]) + 4
+    }
+    if (latestTool && room > 256) {
+      const label = '[Latest tool result preview — consult the transcript or its referenced output attachment for complete content]'
+      const body = capMiddle(latestTool, Math.max(0, Math.min(4096, room) - escapedBytes(label) - 2), escapedBytes)
+      current.push(`${label}\n${body}`)
+    }
+    return [lead, excerpts, ...current].filter(Boolean).join('\n\n')
   }
   // Best-effort: when the frame had to cut a huge tool result, the full output
   // goes to a file and the frame keeps a pointer. A failed upload falls back to

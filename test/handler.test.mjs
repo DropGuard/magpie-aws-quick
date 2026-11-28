@@ -47,7 +47,7 @@ function attachFetch(over = {}) {
     calls.push({ url: u, init })
     if (u.includes('upload-attachment')) return over.upload ?? j({ attachmentId: 'att-ctx' })
     if (u.includes('attachment-dlp-status')) return j({ dlpJobStatus: 'COMPLETED', policyAction: 'ALLOW' })
-    if (u.includes('qbs-event')) return j({ eventResponse: { invokeAgentResponse: { api_response: { status: 200, body: { path: '/data/s3files/u/sessions/t/workspace/attached_files/context.txt' } } } } })
+    if (u.includes('qbs-event')) return j({ eventResponse: { invokeAgentResponse: { api_response: { status: 200, body: { path: over.path ?? '/data/s3files/u/sessions/t/workspace/attached_files/context.txt' } } } } })
     return j({ error: `unexpected ${u}` }, 404)
   }
   return { fn, calls }
@@ -1436,10 +1436,12 @@ test('a fresh thread too large for one frame sends the conversation as an attach
   )
   assert.equal(res.status, 200)
   const payload = fake.state.userMessages.at(-1).payload
-  // The old bridge shape: the conversation up to the last message is in the
-  // file, and the last message (short enough) rides in the frame beside the
-  // pointer. No task/recap blocks — the model reads the whole file first.
-  assert.match(payload.text, /conversation up to the last message is in the attached file context_[0-9a-f]{8}\.txt/)
+  // The file preserves history; the current request stays in the frame. The
+  // archive is evidence to consult as needed, not a mandatory full reread.
+  assert.match(payload.text, /full conversation is in the attached file context_[0-9a-f]{8}\.txt/)
+  assert.ok(payload.text.includes('only when specific information is missing'), 'the pointer calls for targeted lookup')
+  assert.ok(!payload.text.includes('Read the whole file with your file tool'), 'no mandatory full read')
+  assert.ok(!payload.text.includes('Continuation excerpts'), 'oversized source messages are not repackaged as hints')
   assert.ok(payload.text.includes('FINAL-ASK'), 'the current turn rides along')
   assert.ok(!payload.text.includes('QUESTION-0-'), 'older turns are not crammed back into the frame')
   assert.ok(!payload.text.includes('[Original task]') && !payload.text.includes('Progress so far'),
@@ -1457,9 +1459,145 @@ test('a fresh thread too large for one frame sends the conversation as an attach
   const threadId = fake.state.userMessages.at(-1).threadId
   const deliver = JSON.parse(calls.find((c) => c.url.includes('qbs-event')).init.body).eventBody.invokeAgent
   assert.equal(deliver.path, `files/upload/${threadId}`)
-  // And the user is told what happened instead of watching the model forget.
+  // The pointer is for Quick; don't echo a repeated handoff note into the
+  // assistant transcript on every fresh thread.
   const events = await readSse(res)
-  assert.ok(events.some((e) => String(e.choices?.[0]?.delta?.content ?? '').includes('附件')), 'the note reaches the client')
+  const said = events.map((e) => String(e.choices?.[0]?.delta?.content ?? '')).join('')
+  assert.ok(!said.includes('上下文超过 Quick 64KB'), 'the handoff note stays out of the client transcript')
+})
+
+test('an archived build log stays complete without a duplicate tool upload or inline log excerpt', async () => {
+  const { fn, calls } = attachFetch()
+  const log = 'BUILD-HEAD\n' + 'b'.repeat(90 * 1024) + '\nBUILD-MIDDLE: actual diagnostic\n' + 'b'.repeat(90 * 1024) + '\nBUILD-TAIL'
+  const messages = oversizedConvo()
+  messages.splice(-1, 0,
+    { role: 'user', content: 'GOAL: repair decoding without changing navigation.' },
+    { role: 'assistant', content: 'Navigation has already been inspected; run the build next.', tool_calls: [{ id: 'build-1', type: 'function', function: { name: 'Bash', arguments: '{"command":"PRIVATE-BUILD-COMMAND"}' } }] },
+    { role: 'tool', tool_call_id: 'build-1', content: log },
+    { role: 'assistant', content: 'PROGRESS: inspect the decoding error before editing more files.' },
+  )
+  const res = await req({ model: 'fast', messages, tools: [fnTool('Bash')] }, { options: { fetchImpl: fn } })
+  assert.equal(res.status, 200)
+  await res.json()
+  const payload = fake.state.userMessages.at(-1).payload
+  const uploads = calls.filter((c) => c.url.includes('upload-attachment'))
+  assert.equal(uploads.length, 1, 'the transcript is the only upload')
+  assert.match(new URL(uploads[0].url).searchParams.get('name'), /^context_/)
+  const archive = Buffer.from(uploads[0].init.body).toString('utf8')
+  assert.ok(archive.includes(log), 'all build output survives byte-for-byte in the transcript')
+  assert.ok(archive.includes('PRIVATE-BUILD-COMMAND'), 'the archive also preserves the original tool call')
+  assert.equal(payload.attachments.filter((entry) => entry.type === 'file').length, 1)
+  assert.match(payload.text, /Continuation excerpts/)
+  assert.match(payload.text, /message \d+ \(assistant\): "PROGRESS:/)
+  assert.ok(payload.text.includes('GOAL: repair decoding'))
+  assert.ok(!payload.text.includes('PRIVATE-BUILD-COMMAND'), 'call arguments are not navigation hints')
+  for (const marker of ['BUILD-HEAD', 'BUILD-MIDDLE', 'BUILD-TAIL']) assert.ok(!payload.text.includes(marker), `no archived log ${marker} inline`)
+  assert.ok(payload.text.includes('FINAL-ASK'), 'the latest request stays visible')
+  assert.ok(!payload.text.includes('Read the whole file with your file tool'))
+})
+
+test('a context handoff keeps a current request over 6 KB inline before adding hints', async () => {
+  const { fn, calls } = attachFetch()
+  const messages = oversizedConvo()
+  const latest = 'CURRENT-HEAD\n' + 'request-'.repeat(1400) + '\nCURRENT-TAIL: do not deploy.'
+  messages.splice(-1, 1,
+    { role: 'assistant', content: 'SHORT-PROGRESS: the next task is verification.' },
+    { role: 'user', content: latest },
+  )
+  const res = await req({ model: 'fast', messages }, { options: { fetchImpl: fn } })
+  assert.equal(res.status, 200)
+  await res.json()
+  const payload = fake.state.userMessages.at(-1).payload
+  assert.ok(payload.text.includes(latest), 'the entire current request survives, not just a short preview')
+  assert.ok(payload.text.includes('SHORT-PROGRESS'))
+  assert.ok(payload.text.indexOf('[End continuation excerpts]') < payload.text.indexOf('CURRENT-HEAD'), 'current instructions follow historical hints')
+  assert.ok(frameBytes(payload.thread_id, payload) <= UPSTREAM_TEXT_LIMIT)
+  const archive = Buffer.from(calls.find((c) => c.url.includes('upload-attachment')).init.body).toString('utf8')
+  assert.ok(archive.includes(latest), 'the full transcript also preserves the current request before its inline budget is known')
+})
+
+test('a handoff ending in a tool result keeps the actual user request and only a small log preview', async () => {
+  const { fn, calls } = attachFetch()
+  const messages = oversizedConvo()
+  const latest = 'CURRENT-REQUEST: verify decoding; do not deploy.'
+  const log = 'CURRENT-LOG-HEAD\n' + 'x'.repeat(90000) + '\nCURRENT-LOG-MIDDLE\n' + 'x'.repeat(90000) + '\nCURRENT-LOG-TAIL'
+  messages.splice(-1, 1,
+    { role: 'user', content: latest },
+    { role: 'assistant', content: 'PROGRESS: run verification before proceeding.', tool_calls: [{ id: 'current-build', type: 'function', function: { name: 'Bash', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'current-build', content: log },
+  )
+  const res = await req({ model: 'fast', messages, tools: [fnTool('Bash')] }, { options: { fetchImpl: fn } })
+  assert.equal(res.status, 200)
+  await res.json()
+  const payload = fake.state.userMessages.at(-1).payload
+  const uploads = calls.filter((c) => c.url.includes('upload-attachment'))
+  assert.equal(uploads.length, 1, 'no independent duplicate log upload')
+  const archive = Buffer.from(uploads[0].init.body).toString('utf8')
+  assert.ok(archive.includes(log), 'the raw log is archived without per-block caps')
+  assert.match(payload.text, /The full conversation is in the attached file/)
+  assert.equal(payload.text.split(latest).length - 1, 1, 'the actual user request stays inline and is not duplicated in excerpts')
+  assert.match(payload.text, /Latest tool result preview/)
+  assert.ok(payload.text.includes('CURRENT-LOG-HEAD') && payload.text.includes('CURRENT-LOG-TAIL'))
+  assert.ok(!payload.text.includes('CURRENT-LOG-MIDDLE'), 'only the bounded head/tail preview is inline')
+  assert.ok(payload.text.indexOf('CURRENT-REQUEST') < payload.text.indexOf('CURRENT-LOG-HEAD'))
+  const hints = payload.text.split('[Continuation excerpts')[1]?.split('[End continuation excerpts]')[0] ?? ''
+  assert.ok(hints.includes('PROGRESS'))
+  assert.ok(!hints.includes('CURRENT-LOG'))
+  assert.ok(frameBytes(payload.thread_id, payload) <= UPSTREAM_TEXT_LIMIT)
+})
+
+test('an unavoidably oversized current request stays complete in the archive and keeps its ending inline', async () => {
+  const { fn, calls } = attachFetch()
+  const messages = oversizedConvo()
+  const latest = 'CURRENT-HEAD\n' + 'x'.repeat(180000) + '\nCURRENT-TAIL: never deploy.'
+  messages.splice(-1, 1,
+    { role: 'assistant', content: 'OPTIONAL-PROGRESS: inspect the parser next.' },
+    { role: 'user', content: latest },
+  )
+  const res = await req({ model: 'fast', messages }, { options: { fetchImpl: fn } })
+  assert.equal(res.status, 200)
+  await res.json()
+  const payload = fake.state.userMessages.at(-1).payload
+  assert.match(payload.text, /Latest user request preview — full text is in the transcript attachment/)
+  assert.ok(payload.text.includes('CURRENT-HEAD') && payload.text.includes('CURRENT-TAIL: never deploy.'))
+  assert.ok(!payload.text.includes('OPTIONAL-PROGRESS'), 'optional hints yield to the current request')
+  const archive = Buffer.from(calls.find((c) => c.url.includes('upload-attachment')).init.body).toString('utf8')
+  assert.ok(archive.includes(latest), 'even the part omitted inline is recoverable')
+  assert.ok(frameBytes(payload.thread_id, payload) <= UPSTREAM_TEXT_LIMIT)
+})
+
+test('actual cloud attachment metadata counts before fitting the handoff or system instructions', async () => {
+  for (const system of ['', 'S'.repeat(32 * 1024)]) {
+    const { fn, calls } = attachFetch({ path: '/cloud/' + 'p'.repeat(1200) + '/context.txt' })
+    const messages = oversizedConvo()
+    const latest = 'CURRENT-HEAD\n' + 'x'.repeat(90000) + '\nCURRENT-TAIL: do not deploy.'
+    messages.splice(-1, 1, { role: 'user', content: [
+      { type: 'text', text: latest },
+      ...Array.from({ length: 4 }, () => ({ type: 'image_url', image_url: { url: 'data:image/png;base64,' + 'Q'.repeat(80 * 1024) } })),
+    ] })
+    if (system) messages.unshift({ role: 'system', content: system })
+    const res = await req({ model: 'fast', messages }, { options: { fetchImpl: fn } })
+    assert.equal(res.status, 200)
+    await res.json()
+    const payload = fake.state.userMessages.at(-1).payload
+    assert.equal(payload.attachments.filter((entry) => entry.type === 'image').length, 4)
+    assert.ok(payload.attachments.every((entry) => entry.path.length > 1200))
+    assert.ok(frameBytes(payload.thread_id, payload) <= UPSTREAM_TEXT_LIMIT, 'metadata is inside the encoded frame budget')
+    if (system) assert.ok(payload.custom_prompt.endsWith(system), 'the complete 32 KB caller instructions survive')
+    assert.ok(payload.text.includes('CURRENT-HEAD') && payload.text.includes('CURRENT-TAIL: do not deploy.'))
+    const archives = calls.filter((c) => c.url.includes('upload-attachment') && new URL(c.url).searchParams.get('name').startsWith('context_'))
+    assert.equal(archives.length, 1)
+    assert.ok(Buffer.from(archives[0].init.body).toString('utf8').includes(latest), 'the uncapped request survives in the archive')
+  }
+})
+
+test('attachment metadata that leaves no handoff room fails before sending an oversized frame', async () => {
+  const { fn } = attachFetch({ path: '/cloud/' + 'p'.repeat(65000) })
+  const before = fake.state.userMessages.length
+  const res = await req({ model: 'fast', messages: oversizedConvo() }, { options: { fetchImpl: fn } })
+  assert.equal(res.status, 400)
+  assert.match((await res.json()).error.message, /context_length_exceeded.*metadata/)
+  assert.equal(fake.state.userMessages.length, before, 'no upstream user message is sent')
 })
 
 test('when the context attachment fails the turn fails loudly so the client compacts', async () => {
@@ -1647,13 +1785,9 @@ test('the current turn\'s injected instructions arrive whole; the tool spec give
   assert.ok(payload.custom_prompt.includes('"required"') || payload.custom_prompt.includes('"path"'), 'schemas survive')
 })
 
-test('a note in the reply does not start a new thread on the next turn', async () => {
-  // The client stores the note as part of the assistant message, so the reply
-  // we hash must contain it. Before this, every note broke the chain: a
-  // subagent whose first turn was noted re-threaded on every subsequent turn,
-  // and a long conversation that attached its transcript re-attached forever.
-  // Uses the attachment note (a loss the client must see); description-only
-  // caps are silent by policy and would not exercise this.
+test('a context attachment does not add a repeated note and the next turn reuses its thread', async () => {
+  // The attachment pointer is sent to Quick, but the user-facing handoff note
+  // is redundant and must not become part of every future transcript.
   const { fn } = attachFetch()
   const f = await startFakeQuick({})
   const sessions = createSessionStore()
@@ -1664,14 +1798,55 @@ test('a note in the reply does not start a new thread on the next turn', async (
       sessions,
       options: { identity: 'note-reuse', log: () => {}, fetchImpl: fn },
     })
-    const j1 = await (await call(oversizedConvo())).json()
+    const messages = oversizedConvo()
+    messages.splice(-1, 0, { role: 'assistant', content: 'HANDOFF-PROGRESS: the parser is the remaining task.' })
+    const j1 = await (await call(messages)).json()
     const content = j1.choices[0].message.content
-    assert.match(content, /附件/, 'the first turn is noted')
+    assert.ok(!content.includes('上下文超过 Quick 64KB'), 'the attachment note is absent from the reply')
     const thread1 = f.state.userMessages.at(-1).threadId
+    assert.ok(f.state.userMessages.at(-1).payload.text.includes('Continuation excerpts'), 'the fresh handoff carries hints')
 
-    const j2 = await (await call([...oversizedConvo(), { role: 'assistant', content }, { role: 'user', content: 'next step' }])).json()
-    assert.ok(!String(j2.choices[0].message.content).includes('附件'), 'the note is not repeated once the thread continues')
-    assert.equal(f.state.userMessages.at(-1).threadId, thread1, 'the same thread continues')
+    const j2 = await (await call([...messages, { role: 'assistant', content }, { role: 'user', content: 'next step' }])).json()
+    assert.ok(!String(j2.choices[0].message.content).includes('上下文超过 Quick 64KB'), 'the note is not repeated')
+    const next = f.state.userMessages.at(-1)
+    assert.equal(next.threadId, thread1, 'the same thread continues')
+    assert.ok(!next.payload.text.includes('Continuation excerpts'), 'hints are not injected again on reuse')
+    assert.ok(!next.payload.text.includes('HANDOFF-PROGRESS'), 'old progress is not duplicated in the delta')
+    assert.equal(next.payload.attachments, undefined, 'the archive is not uploaded again')
+  } finally {
+    await f.close()
+  }
+})
+
+test('a dead reused thread rebuilds oversized history with the current request and source hints', async () => {
+  let turn = 0
+  const { fn } = attachFetch()
+  const f = await startFakeQuick({
+    script: (payload) => ++turn === 2 ? [{ type: 'error', payload: { message: 'thread not found' } }] : defaultScript(payload),
+  })
+  const sessions = createSessionStore()
+  try {
+    const messages = oversizedConvo()
+    messages.splice(-1, 0, { role: 'assistant', content: 'RETRY-PROGRESS: navigation is checked; decoding is next.' })
+    const call = (history) => handleChatCompletions({
+      body: { model: 'fast', tools: [fnTool('Read')], messages: history },
+      outpostMgr: fakeMgr(f), sessions,
+      options: { identity: 'handoff-retry', fetchImpl: fn, log: () => {} },
+    })
+    const first = (await (await call(messages)).json()).choices[0].message
+    const res = await call([...messages, first, { role: 'user', content: 'CURRENT-RETRY: verify decoding only.' }])
+    assert.equal(res.status, 200)
+    await res.json()
+    const turns = f.state.userMessages
+    assert.equal(turns.length, 3)
+    assert.equal(turns[1].threadId, turns[0].threadId, 'the failed attempt used the original thread')
+    assert.notEqual(turns[2].threadId, turns[0].threadId, 'recovery creates a fresh thread')
+    const payload = turns[2].payload
+    assert.ok(payload.text.includes('Continuation excerpts'))
+    assert.ok(payload.text.includes('RETRY-PROGRESS'))
+    assert.ok(payload.text.includes('CURRENT-RETRY: verify decoding only.'))
+    assert.ok(payload.attachments.some((entry) => entry.type === 'file' && entry.name.startsWith('context_')))
+    assert.ok(frameBytes(payload.thread_id, payload) <= UPSTREAM_TEXT_LIMIT)
   } finally {
     await f.close()
   }
@@ -1847,6 +2022,9 @@ test('a huge tool result on a reused thread is uploaded instead of truncated', a
     assert.ok(payload.text.includes('MEGA-TAIL'), 'the newest bytes still reach the model')
     const upCall = calls.find((c) => c.url.includes('upload-attachment'))
     assert.ok(upCall, 'upload flow used')
+    assert.equal(Buffer.from(upCall.init.body).toString('utf8'), huge, 'the independent attachment is the complete raw output')
+    assert.ok(payload.text.includes('MEGA-HEAD'), 'the preview keeps the start as well as the end')
+    assert.ok(!payload.text.includes('Continuation excerpts'), 'a reused thread does not get a handoff block')
     const threadId = f.state.userMessages.at(-1).threadId
     const deliver = JSON.parse(calls.filter((c) => c.url.includes('qbs-event')).at(-1).init.body).eventBody.invokeAgent
     assert.equal(deliver.path, `files/upload/${threadId}`)

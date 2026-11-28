@@ -11,7 +11,7 @@
 //   3. tool spec             description trimmed -> lite -> names
 //   4. history               dropped -> uploaded as an attachment
 //   5. everything else       cut, and stated
-import { byteLen, escapedBytes } from '../translate.ts'
+import { byteLen, escapedBytes, capText, setInstructions } from '../translate.ts'
 import { buildToolPreamble } from '../tools.ts'
 
 /** What Quick accepts for one user_message; the plugin sends a little under. */
@@ -25,7 +25,7 @@ export const ESCAPE_HEADROOM = 1.03
 
 export type ConcessionCode =
   | 'system' | 'preamble-desc' | 'preamble-lite' | 'preamble-names'
-  | 'history-drop' | 'history-attach' | 'tool-shrink' | 'turn-cap'
+  | 'history-drop' | 'tool-shrink' | 'turn-cap'
   | 'frame-tail' | 'reminder'
 
 export type Concession = {
@@ -42,7 +42,6 @@ export const CONCESSION_NOTES: Record<ConcessionCode, string> = {
   'preamble-lite': '工具说明过长，已省略参数结构、只留名称与描述（参数需按用途推断）',
   'preamble-names': '工具说明过长，已只保留工具名',
   'history-drop': '有较早消息装不进一帧，已丢弃',
-  'history-attach': '上下文超过 Quick 64KB 单帧上限，已把完整对话作为附件传给 Quick（模型会先读取该文件）',
   'tool-shrink': '工具结果过大，已保留头尾、省略中间（需要更多内容就在原工具上缩小范围重跑）',
   'turn-cap': '当前消息过长，已保留开头和结尾',
   'frame-tail': '整帧装不下，已截短末尾',
@@ -52,6 +51,20 @@ export const CONCESSION_NOTES: Record<ConcessionCode, string> = {
 /** Bytes the frame costs for a given text/prompt pair, envelope included. */
 export function frameBytes(threadId: string | undefined, payload: Record<string, unknown>): number {
   return byteLen(JSON.stringify({ type: 'user_message', payload: { ...(threadId ? { thread_id: threadId } : {}), ...payload } }))
+}
+
+/** Exact extra encoded text room after actual attachment metadata is known. */
+export function remainingTextRoom(input: {
+  threadId: string
+  payload: Record<string, unknown>
+  systemText: string
+  customPrompt: string
+}): number {
+  const probe = { ...input.payload }
+  const reservedSystem = capText(input.systemText, SYSTEM_RESERVE_CAP, escapedBytes)
+  // No thread ID means lossless placement of the reserved instructions.
+  setInstructions(probe, reservedSystem, input.customPrompt)
+  return Math.max(0, UPSTREAM_FRAME_LIMIT - frameBytes(input.threadId, probe))
 }
 
 /**

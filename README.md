@@ -341,11 +341,19 @@ browser or in a private/incognito window, without signing out of the others.
   tool schemas are compacted automatically (schema de-annotation, tool-spec
   lite then names-only fallback, capped tool results). A fresh thread whose
   whole transcript cannot fit one frame does not lose its middle: the
-  conversation up to the last message goes up as a `context_*.txt` attachment
-  through Quick's own upload flow, and the frame keeps a "read the whole file
-  first" pointer. The last message itself rides in the frame when it is under
-  6 KB, so the current turn is visible without a file read. If the upload fails
-  too, the request errors with 400
+  full conversation goes up as a lossless `context_*.txt` attachment through
+  Quick's own upload flow, including original tool output and the current
+  request. After actual attachment metadata is counted, the frame keeps the
+  latest user request and, when room remains, up to 4 KB of quoted earlier user/assistant
+  messages as navigation hints—not a generated or verified summary. Tool logs
+  and call arguments are not copied into those hints. The archive is consulted
+  only for missing information, not read in full before continuing. The latest
+  request stays whole inline when it fits; otherwise its full text stays in the
+  archive alongside an explicitly marked head/tail preview. A final tool result
+  gets a bounded preview when room permits. Already uploaded tool output keeps
+  its file reference rather than being uploaded again inside the transcript.
+  Reused threads do not receive the hints again. If the upload fails, the
+  request errors with 400
   `context_length_exceeded` so the client compacts its own history instead of
   working from a silently gutted transcript (`contextAttachments:false` disables
   the upload and keeps the loud 400). Ordinary chat keeps full system instructions when they fit alongside the

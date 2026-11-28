@@ -232,13 +232,13 @@ const MIDDLE_MARK = '\n…[middle truncated]…\n'
  * brief — so the current turn and a pinned opening message are cut in the
  * middle. (System instructions keep capText's placement.)
  */
-export function capMiddle(s, maxBytes) {
+export function capMiddle(s, maxBytes, measure = byteLen) {
   const str = String(s ?? '')
-  if (byteLen(str) <= maxBytes) return str
-  const room = maxBytes - byteLen(MIDDLE_MARK)
-  if (room < 512) return capText(str, maxBytes)
-  const head = fitBytes(str, Math.floor(room * 0.6))
-  return head + MIDDLE_MARK + tailBytes(str, room - byteLen(head))
+  if (measure(str) <= maxBytes) return str
+  const room = maxBytes - measure(MIDDLE_MARK)
+  if (room < 512) return capText(str, maxBytes, measure)
+  const head = fitBytes(str, Math.floor(room * 0.6), measure)
+  return head + MIDDLE_MARK + tailBytes(str, room - measure(head), measure)
 }
 
 export function frameBytes(threadId, payload) {
@@ -269,14 +269,15 @@ export function setInstructions(payload, system, custom, threadId?: string) {
 const STALE_TOOL_CAP = 2 * 1024
 
 /** Longest suffix of `s` within `max` bytes. */
-function tailBytes(s, max) {
+function tailBytes(s, max, measure = byteLen) {
   if (max <= 0) return ''
   let lo = 0, hi = s.length
   while (lo < hi) {
     const mid = (lo + hi) >> 1
-    if (byteLen(s.slice(mid)) <= max) hi = mid
+    if (measure(s.slice(mid)) <= max) hi = mid
     else lo = mid + 1
   }
+  if (lo && /[\uDC00-\uDFFF]/.test(s[lo])) lo++
   return s.slice(lo)
 }
 

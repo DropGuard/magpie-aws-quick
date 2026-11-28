@@ -56,9 +56,8 @@ async function run(body) {
     session: async () => ({ ws_host: fake.wsHost, id_token: 't', usable_until: Math.floor(Date.now() / 1000) + 600 }),
   }
   const res = await handleChatCompletions({
-    // Streaming on: notes (what was conceded, that a transcript rode an
-    // attachment) only ride the stream — the non-stream shape has no place
-    // for them.
+    // Inspect both the encoded upstream frame and client-visible stream so
+    // an attachment instruction cannot turn into a repeated handoff note.
     body: { stream: true, ...body },
     outpostMgr: { ensure: async () => outpost },
     options: { identity: 'invariants', log: () => {}, fetchImpl: attachFetch },
@@ -139,7 +138,7 @@ test('invariant: dropping parameter schemas is named', async () => {
   assert.ok(!payload.custom_prompt.includes('"required"'), 'schemas are gone in this frame')
 })
 
-test('invariant: history that cannot fit arrives as an attachment, not as drops', async () => {
+test('invariant: history that cannot fit arrives as an attachment without a repeated client note', async () => {
   // A long reused-then-lost conversation: the transcript is many times a frame.
   const messages = []
   for (let i = 0; i < 12; i++) {
@@ -150,8 +149,27 @@ test('invariant: history that cannot fit arrives as an attachment, not as drops'
   const { payload, said } = await run({ model: 'fast', messages, tools: [] })
   assert.match(payload.text, /is in the attached file context_[0-9a-f]{8}\.txt/, 'the transcript rides an attachment')
   assert.ok(payload.attachments.some((a) => a.type === 'file'), 'a file attachment is declared')
+  assert.ok(payload.text.includes('only when specific information is missing'), 'Quick receives the targeted lookup instruction')
+  assert.ok(!payload.text.includes('Read the whole file with your file tool'), 'no read-the-entire-archive prerequisite')
   assert.ok(payload.text.includes('FINAL-ASK'))
-  assert.match(said, /附件/, 'the client is told')
+  assert.ok(!said.includes('上下文超过 Quick 64KB'), 'no repeated handoff note is added to the reply')
+})
+
+test('invariant: handoff hints never displace encoded system rules or the current request', async () => {
+  const sys = system(20000)
+  const history = Array.from({ length: 24 }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', content: `OLD-${i} ` + 'h'.repeat(4000) }))
+  const latest = 'CURRENT-HEAD\n' + '"\\\n步骤'.repeat(700) + '\nCURRENT-TAIL: verify only.'
+  const progress = Array.from({ length: 6 }, (_, i) => ({ role: 'assistant', content: `PROGRESS-${i}: ` + '"\\\n状态'.repeat(100) }))
+  const { payload, frameBytes } = await run({
+    model: 'fast',
+    tools: tools(14),
+    messages: [{ role: 'system', content: sys }, ...history, ...progress, { role: 'user', content: latest }],
+  })
+  assert.ok(payload.custom_prompt.endsWith(sys), 'optional hints do not shorten caller instructions')
+  assert.ok(payload.text.includes(latest), 'the whole encoded current request survives')
+  assert.ok(payload.text.includes('Continuation excerpts'), 'the spare room carries bounded hints')
+  assert.ok(payload.text.indexOf('[End continuation excerpts]') < payload.text.indexOf('CURRENT-HEAD'))
+  assert.ok(frameBytes <= FRAME, `${frameBytes} encoded bytes are within ${FRAME}`)
 })
 
 test('invariant: every cut the client can see is named by cutNote', () => {

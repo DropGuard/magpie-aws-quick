@@ -17,16 +17,18 @@ import crypto from 'node:crypto'
 import { QuickWsError } from '../quickws.ts'
 import { normalizeTools, buildToolPreamble } from '../tools.ts'
 import {
-  renderTranscript, renderDelta, renderToolCalls, textOf, byteLen, capText, capMiddle, setInstructions, canonRole,
+  renderTranscript, renderDelta, renderToolCalls, textOf, byteLen, escapedBytes, capText, capMiddle, setInstructions, canonRole,
 } from '../translate.ts'
 import type { RenderStats } from '../translate.ts'
 import { resolveReuse } from './reuse.ts'
 import { restoreTaken } from './session.ts'
 import type { ThreadEntry } from '../sessions.ts'
 import type { Reuse } from './reuse.ts'
-import { pickTurnImages, createAttachmentFlow, CONTEXT_ATTACHED_NOTE, TOO_LONG_ERR, TOOL_UPLOAD_MIN } from './attachments.ts'
+import { pickTurnImages, createAttachmentFlow, TOO_LONG_ERR, TOOL_UPLOAD_MIN } from './attachments.ts'
+import type { AttachmentFlow, ContextAttachment } from './attachments.ts'
+import { continuationExcerpts } from './continuation.ts'
 import { PLAIN_TEXT_NOTE, TOOLS_STILL_APPLY, RELAYED_NOTE, DIRECT_WORK_NOTE, EXACT_STRINGS_NOTE, INVALID_CALL_TOOL, cutNote } from './prompts.ts'
-import { frameRoom, pickPreamble } from '../protocol/frame.ts'
+import { frameBytes, frameRoom, remainingTextRoom, pickPreamble, UPSTREAM_FRAME_LIMIT } from '../protocol/frame.ts'
 
 
 
@@ -59,9 +61,9 @@ export interface TurnContext {
   mergeStats: (from: RenderStats | null | undefined) => void
   fitPreamble: (list?: any[], need?: number) => string
   uploadAll: (tid: string) => Promise<{ entries: any[]; failed: number }>
-  attachContext: (tid: string) => Promise<any>
-  /** Pointer text for a transcript replaced by `entry`, with a recent tail. */
-  attachPointer: (attachment: any) => string
+  attachContext: AttachmentFlow['attachContext']
+  /** Pointer and current request, with optional source excerpts before it. */
+  attachPointer: AttachmentFlow['attachPointer']
   /** Upload one oversized tool result (null when it could not be delivered). */
   uploadToolResult: (tid: string, name: string, text: string) => Promise<any | null>
   imageNoteFor: (failed: number) => string
@@ -255,7 +257,13 @@ export async function composeAttempt(ctx: TurnContext, { threadId, reuse, retry 
   const uploaded = await ctx.uploadAll(threadId)
   const imageNote = ctx.imageNoteFor(uploaded.failed)
   const attachments = ctx.images.attachments.concat(uploaded.entries)
-  let contextNote = ''
+  // A retry onto a fresh thread needs the full spec, not the reused delta's.
+  const toolSpec = retry
+    ? (ctx.tools.length ? ctx.fitPreamble(ctx.tools, ctx.currentTurnNeed) : '')
+    : ctx.toolsCustom
+  const custom = [ctx.customPrompt, toolSpec].filter(Boolean).join('\n\n')
+  let contextAttachment: ContextAttachment | null = null
+  let contextBudget = 0
   let text: string
   let reused = false
   let local: RenderStats | null = null
@@ -291,6 +299,7 @@ export async function composeAttempt(ctx: TurnContext, { threadId, reuse, retry 
     reused = true
   } else {
     local = {}
+    let archiveConvo = ctx.convo
     let rendered = renderTranscript(ctx.convo, '', { maxBytes: ctx.turnBudget, stats: local })
     // A fresh frame can still carry this turn's tool results (after a re-thread
     // the client resends the conversation). Cutting one is the same loss as on
@@ -302,6 +311,7 @@ export async function composeAttempt(ctx: TurnContext, { threadId, reuse, retry 
       const swapped = await swapBigToolResults(ctx, threadId, ctx.convo, attachments, { startAt: lastAsst + 1 })
       if (swapped) {
         local = {}
+        archiveConvo = swapped
         rendered = renderTranscript(swapped, '', { maxBytes: ctx.turnBudget, stats: local })
       }
     }
@@ -310,18 +320,28 @@ export async function composeAttempt(ctx: TurnContext, { threadId, reuse, retry 
     // History that had to be dropped from the frame is not thrown away: it
     // rides an attachment and the message only points at it.
     if (local.dropped) {
-      let entry: any = null
       try {
-        entry = await ctx.attachContext(threadId)
+        // Keep references to any separately uploaded tool output instead of
+        // uploading its full body a second time inside the transcript.
+        contextAttachment = await ctx.attachContext(threadId, archiveConvo)
       } catch (e: any) {
         if (ctx.signal?.aborted || e?.name === 'AbortError') throw e
         ctx.options?.log?.(`[aws-quick] context attachment failed: ${String(e?.message ?? e).slice(0, 200)}`)
       }
-      if (!entry) throw new QuickWsError(TOO_LONG_ERR, { kind: 'too_large', status: 400 })
-      attachments.push(entry.entry)
-      text = ctx.attachPointer(entry)
+      if (!contextAttachment) throw new QuickWsError(TOO_LONG_ERR, { kind: 'too_large', status: 400 })
+      attachments.push(contextAttachment.entry)
+      // Only the actual cloud entries tell us their encoded metadata cost.
+      // Reserve system instructions and the trailing reminder first, then fit
+      // the pointer/current request. The archive already preserves its original.
+      const suffix = imageNote + (ctx.toolsReminder ? `\n\n${ctx.toolsReminder}` : '')
+      const baseline: any = { ...ctx.base, text: suffix, attachments }
+      if (ctx.tools.length) baseline.web_search_enabled = false
+      contextBudget = Math.max(0, Math.min(ctx.frameCap - escapedBytes(suffix), remainingTextRoom({
+        threadId, payload: baseline, systemText: ctx.systemText, customPrompt: custom,
+      })))
+      if (contextBudget < 1024) throw new QuickWsError('context_length_exceeded: attachment metadata and instructions leave no room for the context handoff', { kind: 'too_large', status: 400 })
+      text = ctx.attachPointer(contextAttachment, contextBudget) + imageNote
       ctx.stats.truncated = true
-      contextNote = CONTEXT_ATTACHED_NOTE
     }
   }
   // The full tool spec rides in custom_prompt (it does not become part of
@@ -333,13 +353,6 @@ export async function composeAttempt(ctx: TurnContext, { threadId, reuse, retry 
   // added since. Fresh threads, including the stale-thread retry, get the
   // full spec. An entry reloaded from disk without toolNames gets everything
   // once.
-  const toolSpec = retry
-    ? (ctx.tools.length ? ctx.fitPreamble(ctx.tools, ctx.currentTurnNeed) : '')
-    : ctx.toolsCustom
-  // The old bridge kept the tool spec in custom_prompt (not in the user
-  // message, where it would stay in Quick's history) and appended a short
-  // reminder after each user message, where the model reads it last.
-  const custom = [ctx.customPrompt, toolSpec].filter(Boolean).join('\n\n')
   let upstreamText = ctx.toolsReminder ? `${text}\n\n${ctx.toolsReminder}` : text
   if (byteLen(upstreamText) > ctx.frameCap) {
     upstreamText = capText(upstreamText, ctx.frameCap)
@@ -351,10 +364,23 @@ export async function composeAttempt(ctx: TurnContext, { threadId, reuse, retry 
   if (ctx.tools.length) payload.web_search_enabled = false
   if (attachments.length) payload.attachments = attachments
   const clippedSystem = setInstructions(payload, ctx.systemText, custom, threadId)
+  if (contextAttachment) {
+    // Optional hints use only spare bytes in the finalized, encoded frame.
+    // Never re-run setInstructions or cap the combined text to fit them.
+    const room = Math.min(UPSTREAM_FRAME_LIMIT - frameBytes(threadId, payload), ctx.frameCap - byteLen(upstreamText)) - 4
+    const excerpts = continuationExcerpts(ctx.convo, room)
+    if (excerpts) {
+      const withHints = ctx.attachPointer(contextAttachment, contextBudget, excerpts) + imageNote
+      const candidate = ctx.toolsReminder ? `${withHints}\n\n${ctx.toolsReminder}` : withHints
+      if (byteLen(candidate) <= ctx.frameCap && frameBytes(threadId, { ...payload, text: candidate }) <= UPSTREAM_FRAME_LIMIT) payload.text = candidate
+    }
+  }
   // The runner yields this note before the turn loop, so it must also be part
   // of the client-visible text: the reply we hash has to match what the client
   // stores, or the next turn starts a new thread.
-  const note = contextNote || (retry
+  // The model sees the attachment pointer in the request. Echoing a note into
+  // the assistant transcript on every fresh-thread handoff only repeats it.
+  const note = contextAttachment ? '' : (retry
     ? (local?.dropped ? '' : cutNote(local, false))
     : cutNote(ctx.stats, clippedSystem))
   return {
